@@ -137,7 +137,8 @@ function render() {
 /* --------------------------------------------------------------- 视频 */
 // 视频地址是引擎现场签发的、会过期，所以库里存的 file_path 才是本体：
 // 已下载的用 <video> 播本地文件，没下载的显示封面 + 提示。
-const videoState = { page: 1, album_id: '', downloaded: '', data: null, busy: false };
+const videoState = { page: 1, album_id: '', downloaded: '', data: null, busy: false,
+                     q: '', sort: 'relevance', results: null };
 
 async function renderVideos(root) {
   const head = el('div', 'view-head');
@@ -147,6 +148,134 @@ async function renderVideos(root) {
     `库内 ${fmtNum(stats.total || 0)} 个，已下载 ${fmtNum(stats.done || 0)}，`
     + `失败 ${fmtNum(stats.failed || 0)}，合计 ${fmtBytes(stats.bytes || 0)}`));
 
+  // 按封面描述搜视频：视频本身没有 AI 索引，但它的封面照片有
+  //（标签 / BLIP 描述 / 语义向量都齐），所以"搜封面"就等于"搜视频"。
+  const searchRow = el('div', 'ai-row');
+  const input = el('input', 'input video-search');
+  input.placeholder = '按封面描述找视频，例如「黑色背景」「树林」「poster」…';
+  input.value = videoState.q;
+  const go = el('button', 'btn tiny primary', '搜视频');
+  const clear = el('button', 'btn tiny ghost', '清空');
+  const runSearch = () => {
+    videoState.q = input.value.trim();
+    videoState.page = 1;
+    renderVideos(root);
+  };
+  input.onkeydown = (ev) => { if (ev.key === 'Enter') runSearch(); };
+  go.onclick = runSearch;
+  clear.onclick = () => { videoState.q = ''; videoState.page = 1; renderVideos(root); };
+
+  const sortSel = el('select', 'select');
+  AI_SORT_OPTIONS.forEach(([value, label]) => sortSel.appendChild(new Option(label, value)));
+  sortSel.value = videoState.sort;
+  sortSel.onchange = () => { videoState.sort = sortSel.value; if (videoState.q) runSearch(); };
+
+  searchRow.appendChild(input);
+  searchRow.appendChild(go);
+  searchRow.appendChild(sortSel);
+  if (videoState.q) searchRow.appendChild(clear);
+  head.appendChild(searchRow);
+  head.appendChild(el('div', 'ai-hint',
+    '提示：搜的是**封面的画面/描述/标签**，不是视频内部的内容；'
+    + '另外只封面的匹配度受封面质量影响（很多封面是标题卡，可能不好认）。'));
+  root.appendChild(head);
+
+  let body = root.querySelector('.video-body');
+  if (!body) {
+    body = el('div', 'video-body');
+    root.appendChild(body);
+  }
+
+  if (videoState.q) {
+    await renderVideoSearch(root, body, input, go);
+    return;
+  }
+  videoState.results = null;
+  await renderVideoList(root, body);
+}
+
+async function renderVideoSearch(root, body, input, go) {
+  go.disabled = true;
+  const params = new URLSearchParams({
+    q: videoState.q, media: 'videos', top_k: '60', sort: videoState.sort || 'relevance',
+  });
+  if (state.filters.album_id) params.set('album_id', state.filters.album_id);
+  if (state.filters.uploader) params.set('uploader', state.filters.uploader);
+  let data;
+  try {
+    data = await api('/api/ai/search?' + params.toString());
+  } catch (e) {
+    go.disabled = false;
+    const fresh = root.querySelector('.video-body');
+    if (fresh) fresh.appendChild(el('div', 'empty', '搜索失败：' + esc(e.message)));
+    return;
+  }
+  go.disabled = false;
+  const fresh = root.querySelector('.video-body');
+  if (fresh) body = fresh;
+  if (!root.isConnected) return;
+  body.innerHTML = '';
+  videoState.results = data;
+
+  const items = data.items || [];
+  if (!items.length) {
+    body.appendChild(el('div', 'empty',
+      `没有找到和「${esc(videoState.q)}」匹配的视频封面。<br>`
+      + '可以换个更具体的画面描述（例如「黑色背景」「一片树林」），'
+      + '或者把右上角的筛选放宽。'));
+    return;
+  }
+  body.appendChild(el('div', 'ai-hint',
+    `匹配到 ${items.length} 个视频封面（按${AI_SORT_OPTIONS.find(o => o[0] === videoState.sort)[1].replace('排序：', '')}排序）`));
+
+  const grid = el('div', 'video-grid');
+  items.forEach((photo) => {
+    const video = photo.video || {};
+    const card = el('div', 'video-card');
+    if (video.has_file) {
+      const player = document.createElement('video');
+      player.controls = true;
+      player.preload = 'metadata';
+      player.poster = `/api/video-cover?video_id=${encodeURIComponent(video.video_id)}`;
+      player.src = `/api/video?video_id=${encodeURIComponent(video.video_id)}`;
+      card.appendChild(player);
+    } else {
+      const cover = el('img', 'video-cover');
+      cover.loading = 'lazy';
+      cover.src = `/api/video-thumb?photo_id=${encodeURIComponent(photo.photo_id)}&size=640`;
+      cover.onerror = () => { cover.src = `/api/thumb?photo_id=${encodeURIComponent(photo.photo_id)}&size=640`; };
+      card.appendChild(cover);
+      card.appendChild(el('div', 'video-badge',
+        video.has_file === false ? '视频未下载' : '仅封面'));
+    }
+    card.appendChild(el('div', 'score-pill', `${Math.round((photo.score || 0) * 100)}%`));
+
+    const meta = el('div', 'video-meta');
+    meta.appendChild(el('div', 'video-title',
+      esc(photo.album_title || '未知相册')));
+    meta.appendChild(el('div', 'video-sub',
+      `上传者 ${esc(photo.uploader_nick || photo.uploader_uin || '未知')}`
+      + ` · ${esc(String(photo.upload_time || '').slice(0, 16))}`));
+    meta.appendChild(el('div', 'video-sub',
+      `评论 ${photo.comment_count || 0} · 点赞 ${photo.like_count || 0}`
+      + (video.duration_ms ? ` · ${Math.round(video.duration_ms / 1000)}s` : '')));
+    if (photo.caption) {
+      meta.appendChild(el('div', 'video-sub', `封面描述：“${esc(photo.caption.slice(0, 60))}”`));
+    }
+    const tags = (photo.tags || []).map((t) => t.name).join('、');
+    if (tags) meta.appendChild(el('div', 'video-sub', esc(tags)));
+    if (video.has_file) {
+      const dl = el('a', 'btn tiny', '另存为');
+      dl.href = `/api/video-file?video_id=${encodeURIComponent(video.video_id)}`;
+      meta.appendChild(dl);
+    }
+    card.appendChild(meta);
+    grid.appendChild(card);
+  });
+  body.appendChild(grid);
+}
+
+async function renderVideoList(root, body) {
   const filters = el('div', 'ai-row');
   const albumSel = el('select', 'select');
   albumSel.appendChild(new Option('全部相册', ''));
@@ -167,17 +296,8 @@ async function renderVideos(root) {
   const reload = el('button', 'btn tiny', '刷新列表');
   reload.onclick = () => renderVideos(root);
   filters.appendChild(reload);
-  head.appendChild(filters);
-  root.appendChild(head);
-
-  // ⚠️ 取列表是 async 的，而这期间 render() 可能被再次触发（会把整个视图清空重建）。
-  //    所以结果必须写进一个"重新取回来"的容器里，而不是闭包里那个 root ——
-  //    否则卡片会 append 到一个已经脱离文档的节点上，页面看起来就是空的。
-  let body = root.querySelector('.video-body');
-  if (!body) {
-    body = el('div', 'video-body');
-    root.appendChild(body);
-  }
+  // 筛选项挂在 body 之前（head 已经在 renderVideos 里追加过了）
+  body.appendChild(filters);
 
   const params = new URLSearchParams({ page: String(videoState.page), per_page: '60' });
   if (videoState.album_id) params.set('album_id', videoState.album_id);
@@ -230,7 +350,12 @@ async function renderVideos(root) {
     meta.appendChild(el('div', 'video-title', esc(v.album_title || v.album_id || '未知相册')));
     meta.appendChild(el('div', 'video-sub',
       [dim, dur, size].filter(Boolean).map(esc).join(' · ') || '—'));
-    meta.appendChild(el('div', 'video-sub', esc((v.upload_time || '').slice(0, 16))));
+    meta.appendChild(el('div', 'video-sub',
+      `${esc(v.uploader_nick || v.uploader_uin || '未知')} · ${esc(String(v.upload_time || '').slice(0, 16))}`));
+    if (v.comment_count || v.like_count) {
+      meta.appendChild(el('div', 'video-sub',
+        `评论 ${v.comment_count || 0} · 点赞 ${v.like_count || 0}`));
+    }
     if (downloaded) {
       const dl = el('a', 'btn tiny', '另存为');
       dl.href = `/api/video-file?video_id=${encodeURIComponent(v.video_id)}`;
@@ -271,6 +396,7 @@ const aiState = {
   busy: false,
   uploading: false,
   sort: 'relevance',     // 结果排序（服务端 /api/ai/search?sort=…）
+  media: '',             // '' 全部 | videos 只看视频 | photos 只看图片
 };
 
 // 与后端 AI_SORT_KEYS 对应
@@ -281,6 +407,12 @@ const AI_SORT_OPTIONS = [
   ['oldest', '排序：最早上传'],
   ['uploader', '排序：上传者'],
   ['interactions', '排序：点赞+评论'],
+];
+
+const AI_MEDIA_OPTIONS = [
+  ['', '全部（图片+视频）'],
+  ['videos', '只看视频'],
+  ['photos', '只看图片'],
 ];
 
 async function loadAiStatus() {
@@ -435,6 +567,20 @@ function renderAi(container) {
     else runAiBrowse();
   };
   row4.appendChild(sortSel);
+
+  // 媒体类型：视频只有 300 多个（照片 4 万多），在"全部"里几乎露不出来，
+  // 想找视频必须能显式切过去。
+  const mediaSel = el('select', 'select');
+  AI_MEDIA_OPTIONS.forEach(([value, label]) => mediaSel.appendChild(new Option(label, value)));
+  mediaSel.value = aiState.media || '';
+  mediaSel.title = '只看视频 / 只看图片';
+  mediaSel.onchange = () => {
+    aiState.media = mediaSel.value;
+    if (aiState.similar) runAiSimilar(aiState.similar);
+    else if (aiState.query) runAiText();
+    else runAiBrowse();
+  };
+  row4.appendChild(mediaSel);
   panel.appendChild(row4);
 
   // AI tag cloud
@@ -539,6 +685,7 @@ function aiFilterParams(extra) {
   if (state.filters.aiDateFrom) params.set('date_from', state.filters.aiDateFrom);
   if (state.filters.aiDateTo) params.set('date_to', state.filters.aiDateTo);
   if (aiState.sort) params.set('sort', aiState.sort);
+  if (aiState.media) params.set('media', aiState.media);
   aiState.tags.forEach((t) => params.append('ai_tag', String(t)));
   return params;
 }
@@ -590,6 +737,7 @@ async function runAiImage(file) {
     if (state.filters.aiDateFrom) form.append('date_from', state.filters.aiDateFrom);
     if (state.filters.aiDateTo) form.append('date_to', state.filters.aiDateTo);
     if (aiState.sort) form.append('sort', aiState.sort);
+    if (aiState.media) form.append('media', aiState.media);
     const res = await fetch('/api/ai/search-image', { method: 'POST', body: form });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));

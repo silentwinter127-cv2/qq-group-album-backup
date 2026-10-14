@@ -711,7 +711,10 @@ class Store:
             "photo_id=COALESCE(excluded.photo_id, videos.photo_id), "
             "uploader_uin=COALESCE(NULLIF(excluded.uploader_uin,''), videos.uploader_uin), "
             "uploader_nick=COALESCE(NULLIF(excluded.uploader_nick,''), videos.uploader_nick), "
-            "upload_epoch=COALESCE(excluded.upload_epoch, videos.upload_epoch), "
+            # 接口不一定每次都带 uploadTime；用 MAX 而不是直接覆盖，
+            # 否则重新抓元数据会把之前从封面拿到的时间抹成 NULL
+            "upload_epoch=COALESCE(MAX(COALESCE(excluded.upload_epoch,0), "
+            "                           COALESCE(videos.upload_epoch,0)), videos.upload_epoch), "
             "upload_time=COALESCE(NULLIF(excluded.upload_time,''), videos.upload_time), "
             "width=COALESCE(excluded.width, videos.width), "
             "height=COALESCE(excluded.height, videos.height), "
@@ -787,7 +790,9 @@ class Store:
         page = max(1, int(page or 1))
         rows = self.query(
             f"SELECT v.*, a.title AS album_title2, p.file_path AS cover_file, "
-            f"       p.file_status AS cover_status "
+            f"       p.file_status AS cover_status, p.comment_count AS cover_comments, "
+            f"       p.like_count AS cover_likes, p.uploader_nick AS cover_nick, "
+            f"       p.upload_time AS cover_time, p.batch_id AS cover_batch "
             f"FROM videos v "
             f"LEFT JOIN albums a ON a.group_id=v.group_id AND a.album_id=v.album_id "
             f"LEFT JOIN photos p ON p.group_id=v.group_id AND p.lloc=v.lloc "
@@ -799,6 +804,11 @@ class Store:
             item = dict(row)
             item.pop("raw_json", None)
             item["album_title"] = item.get("album_title") or item.get("album_title2") or ""
+            # 视频表里没存发布者/时间时，用封面照片那份补上（两者是同一批动态里的记录）
+            item["uploader_nick"] = item.get("uploader_nick") or item.get("cover_nick") or ""
+            item["upload_time"] = item.get("upload_time") or item.get("cover_time") or ""
+            item["comment_count"] = item.get("cover_comments") or 0
+            item["like_count"] = item.get("cover_likes") or 0
             items.append(item)
         return {"total": total, "page": page, "per_page": per_page, "items": items}
 
@@ -813,6 +823,58 @@ class Store:
             (str(group_id),))
         self.commit()
         return cur.rowcount or 0
+
+    def video_ids_for_photos(self, group_id: str, photo_ids: Sequence[str]) -> Dict[str, str]:
+        """photo_id → video_id（只对"这张照片是某个视频的封面"的那些）。
+
+        用途：检索返回的是照片，但其中一部分照片其实是**视频的封面**。
+        有了这张映射，就能在结果里标明「这其实是个视频」，并把播放地址给出来。
+        """
+        ids = [str(p) for p in photo_ids if p]
+        if not ids:
+            return {}
+        out: Dict[str, str] = {}
+        # SQLite 的参数上限是 999，分批查
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ",".join("?" for _ in chunk)
+            rows = self.query(
+                f"SELECT photo_id, video_id FROM videos "
+                f"WHERE group_id=? AND photo_id IN ({marks})", [str(group_id), *chunk])
+            for row in rows:
+                if row["photo_id"]:
+                    out[str(row["photo_id"])] = str(row["video_id"])
+        return out
+
+    def videos_by_ids(self, group_id: str, video_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """video_id → 视频行（含时长、尺寸、本地文件、播放地址）。"""
+        ids = [str(v) for v in video_ids if v]
+        if not ids:
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ",".join("?" for _ in chunk)
+            rows = self.query(
+                f"SELECT * FROM videos WHERE group_id=? AND video_id IN ({marks})",
+                [str(group_id), *chunk])
+            for row in rows:
+                item = dict(row)
+                item.pop("raw_json", None)
+                out[str(row["video_id"])] = item
+        return out
+
+    def photos_of_videos(self, group_id: str, album_id: Optional[str] = None) -> List[str]:
+        """所有"视频封面"对应的 photo_id —— 检索时用它把范围收窄到视频。"""
+        sql = ("SELECT p.photo_id FROM videos v JOIN photos p "
+               "ON p.group_id=v.group_id AND p.photo_id=v.photo_id "
+               "WHERE v.group_id=?")
+        params: List[Any] = [str(group_id)]
+        if album_id:
+            sql += " AND v.album_id=?"
+            params.append(str(album_id))
+        return [str(r["photo_id"]) for r in self.query(sql, params)]
+
 
     # ---------------------------------------------------------------- feeds
     def upsert_feed(self, group_id: str, feed: Dict[str, Any], server_offset: int = 0) -> None:

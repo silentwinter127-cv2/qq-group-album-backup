@@ -280,3 +280,7 @@ table.data tr:hover td { background: var(--bg-card); }
 .video-title { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .video-sub { font-size: 11px; color: var(--text-dim); }
 .video-meta .btn { align-self: flex-start; margin-top: 4px; }
+
+/* 视频页的搜索框（按封面描述找视频） */
+.video-search { min-width: 320px; flex: 1 1 320px; }
+.video-meta .score-pill { position: static; align-self: flex-start; }

@@ -506,6 +506,55 @@ class Api:
         return [dict(r) for r in rows]
 
 
+def annotate_video_covers(api: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """给检索结果标出「这张其实是某个视频的封面」，并附上视频信息。
+
+    为什么能做：视频的封面本身就是一条 photos 记录，且视频表里存了它的 video_id。
+    检索命中的是封面照片，但用户想找的其实是视频 —— 所以要能一眼看出来、能直接播。
+
+    抽成模块级函数（而不是 Handler 的方法）是为了能单独测试，不必起整个 HTTP 层。
+    """
+    if not items:
+        return items
+    mapping = api.store.video_ids_for_photos(api.group_id, [i["photo_id"] for i in items])
+    if not mapping:
+        for item in items:
+            item["is_video_cover"] = False
+        return items
+    videos = api.store.videos_by_ids(api.group_id, list(mapping.values()))
+    for item in items:
+        video_id = mapping.get(item["photo_id"])
+        item["is_video_cover"] = bool(video_id)
+        if not video_id:
+            continue
+        video = videos.get(video_id) or {}
+        item["video_id"] = video_id
+        item["video"] = {
+            "video_id": video_id,
+            "duration_ms": video.get("duration_ms"),
+            "width": video.get("width"),
+            "height": video.get("height"),
+            "file_status": video.get("file_status"),
+            "file_size": video.get("file_size"),
+            "has_file": bool(video.get("file_path") and video.get("file_status") == "done"),
+        }
+    return items
+
+
+def filter_by_media(api: Any, items: List[Dict[str, Any]], media: str) -> List[Dict[str, Any]]:
+    """media: '' 全部 / 'videos' 只看视频 / 'photos' 只看非视频。
+
+    先标注再过滤：视频只占照片总数的不到 1%，所以在"全部"里几乎露不出来，
+    必须能显式切到"只看视频"。
+    """
+    if media not in ("videos", "photos"):
+        return items
+    annotated = annotate_video_covers(api, items)
+    if media == "videos":
+        return [i for i in annotated if i.get("is_video_cover")]
+    return [i for i in annotated if not i.get("is_video_cover")]
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "QQAlbumBackup/1.0"
     api: Api = None  # type: ignore
@@ -672,17 +721,32 @@ class Handler(BaseHTTPRequestHandler):
         usable, reason = searcher.usable()
         if not usable:
             return self._error(reason, 503)
-        top_k = int(fields.get("top_k") or 60)
+        top_k = max(1, int(fields.get("top_k") or 60))
         filters = {key: fields.get(key, "") for key in
                    ("album_id", "uploader", "date_from", "date_to")}
+        # 与 /api/ai/search 保持一致：媒体类型 / 排序 / AI 标签也要认，
+        # 否则「只看视频」在以图搜图那条路上会被静默忽略。
+        media = (fields.get("media") or "").strip().lower()
+        if media not in ("videos", "photos"):
+            media = ""
+        sort = (fields.get("sort") or "relevance").strip().lower()
+        if sort not in AI_SORT_KEYS:
+            sort = "relevance"
+        ai_tag_ids = [int(v) for v in str(fields.get("ai_tag") or "").split(",") if v.strip().isdigit()]
+        min_conf = float(fields.get("min_confidence") or 0)
         try:
             image = engine.load_image_bytes(upload[1])
         except Exception as exc:
             return self._error(f"无法解析图片：{exc}", 400)
-        items = searcher.search_image(image, top_k=top_k, filters=filters or None)
+        pool_k = max(top_k, min(400, top_k * 4))
+        items = searcher.search_image(image, top_k=pool_k, filters=filters or None)
         decorated = self._decorate_results(items)
+        decorated = self._ai_tag_filter(decorated, ai_tag_ids, min_conf)
+        decorated = filter_by_media(self.api, decorated, media)
+        decorated = self._ai_sort(decorated, sort)[:top_k]
         return self._json({"mode": "image", "filename": upload[0], "total": len(decorated),
-                           "items": decorated, "filters": filters})
+                           "items": decorated, "filters": filters, "sort": sort,
+                           "media": media, "ai_tags": ai_tag_ids})
 
     def _api_index_image(self, content_type: str) -> None:
         """Describe an arbitrary uploaded image with tags (no library lookup)."""
@@ -783,12 +847,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_video((params.get("video_id") or [""])[0], stream=False)
         if path == "/api/video-cover":
             video_id = (params.get("video_id") or [""])[0]
+            size = int((params.get("size") or ["640"])[0])
             row = self.api.store.query_one(
                 "SELECT photo_id FROM videos WHERE group_id=? AND video_id=?",
                 (self.api.group_id, video_id))
+            # 没绑上封面时退回视频自带的 cover_url，别直接 404
             if not row or not row["photo_id"]:
+                cover = self.api.store.query_one(
+                    "SELECT cover_url FROM videos WHERE group_id=? AND video_id=?",
+                    (self.api.group_id, video_id))
+                if cover and cover["cover_url"]:
+                    return self._redirect_image(cover["cover_url"])
                 return self._error("no cover", 404)
-            return self._serve_thumb(row["photo_id"], 640)
+            return self._serve_thumb(row["photo_id"], size)
+        if path == "/api/video-thumb":
+            # 搜索结果是"封面照片"，前端直接用 photo_id 取缩略图
+            photo_id = (params.get("photo_id") or [""])[0]
+            if not photo_id:
+                return self._error("photo_id required", 400)
+            return self._serve_thumb(photo_id, int((params.get("size") or ["640"])[0]))
         if path == "/api/image":
             photo_id = (params.get("photo_id") or [""])[0]
             row = self.api.store.query_one("SELECT * FROM photos WHERE group_id=? AND photo_id=?",
@@ -853,6 +930,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._file(cache_path)
         self.send_response(302)
         self.send_header("Location", cover)
+        self.end_headers()
+
+    def _redirect_image(self, url: str) -> None:
+        """把 CDN 图片地址 302 给浏览器（顺手把 http 升成 https）。"""
+        target = (url or "").replace("http://", "https://", 1)
+        if not target:
+            return self._error("no image", 404)
+        self.send_response(302)
+        self.send_header("Location", target)
         self.end_headers()
 
     def _serve_video(self, video_id: str, stream: bool = True) -> None:
@@ -999,23 +1085,38 @@ class Handler(BaseHTTPRequestHandler):
         ai_tag_ids = [int(v) for v in (params.get("ai_tag") or []) if v.isdigit()]
         min_conf = float(one("min_confidence", "0") or 0)
         filters = self._ai_filters(params)
+        # 媒体类型：'' 全部 / videos 只看视频（靠封面照片命中）/ photos 只看非视频
+        media = (one("media") or "").strip().lower()
+        if media not in ("videos", "photos"):
+            media = ""
         # 排序：relevance（默认，相似度）| similar（只看语义）| newest | oldest | uploader | interactions
         sort = (one("sort", "relevance") or "relevance").strip().lower()
         if sort not in AI_SORT_KEYS:
             sort = "relevance"
-        # 标签/排序会在候选池上再筛一道，所以要多取一些，否则 top_k=10 时筛完可能只剩 2 张
+        # 标签/排序/媒体过滤会在候选池上再筛一道，所以要多取一些，
+        # 否则 top_k=10 又要"只看视频"时可能筛完只剩 2 张
         pool_k = max(top_k, min(400, top_k * 4))
+
+        def finish(items: List[Dict[str, Any]], key: str = "",
+                   extra: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+            """统一收尾：媒体过滤 → 排序 → 截断（顺序不能反）。"""
+            items = filter_by_media(self.api, items, media)
+            items = self._ai_sort(items, key or sort)[:top_k]
+            return items
+
 
         searcher = self.api.searcher
         usable, reason = searcher.usable()
         if not usable and (query or similar_to):
             # caption-only search still works without the vector index
             if query:
-                items = searcher.search_captions(query, top_k=pool_k, filters=filters)
-                if items:
-                    return self._json(self._ai_payload("caption", items, top_k, sort,
-                                                       query=query, filters=filters,
-                                                       ai_tags=ai_tag_ids, note=reason))
+                caption_items = searcher.search_captions(query, top_k=pool_k, filters=filters)
+                if caption_items:
+                    decorated = self._decorate_results(caption_items)
+                    return self._json({"mode": "caption", "total": len(decorated),
+                                       "items": finish(decorated), "query": query,
+                                       "filters": filters, "sort": sort, "media": media,
+                                       "ai_tags": ai_tag_ids, "note": reason})
             return self._json({"error": reason}, 503)
 
         if query:
@@ -1028,10 +1129,10 @@ class Handler(BaseHTTPRequestHandler):
                 row["caption_score"] = entry.get("caption_score", 0.0)
                 row["caption"] = entry.get("caption") or searcher._captions.get(row["photo_id"], "")
             items = self._ai_tag_filter(decorated, ai_tag_ids, min_conf)
-            items = self._ai_sort(items, sort)[:top_k]
+            items = finish(items)
             return self._json({"mode": "text", "total": len(items), "items": items,
                                "query": query, "filters": filters,
-                               "sort": sort, "ai_tags": ai_tag_ids,
+                               "sort": sort, "media": media, "ai_tags": ai_tag_ids,
                                "semantic_count": len(combined["semantic"]),
                                "caption_count": len(combined["captions"])})
         elif similar_to:
@@ -1047,11 +1148,18 @@ class Handler(BaseHTTPRequestHandler):
             if ai_tag_ids:
                 sets = [set(searcher.photos_by_ai_tag(t, min_conf, limit=100000)) for t in ai_tag_ids]
                 photo_ids = list(set.intersection(*sets)) if sets else []
-            rows = self.api.store.query(
-                "SELECT p.*, a.title AS album_title FROM photos p LEFT JOIN albums a "
-                "ON a.group_id=p.group_id AND a.album_id=p.album_id "
-                "WHERE p.group_id=? AND p.file_status IN ('done','thumb-only') "
-                "ORDER BY p.upload_epoch DESC, p.photo_id LIMIT 4000", (self.api.group_id,))
+            sql = ("SELECT p.*, a.title AS album_title FROM photos p LEFT JOIN albums a "
+                   "ON a.group_id=p.group_id AND a.album_id=p.album_id "
+                   "WHERE p.group_id=? AND p.file_status IN ('done','thumb-only')")
+            sql_params: List[Any] = [self.api.group_id]
+            if media == "videos":
+                # 只看视频时直接按封面收敛，不必扫全表
+                sql += (" AND p.photo_id IN (SELECT pv.photo_id FROM videos v "
+                        "JOIN photos pv ON pv.group_id=v.group_id AND pv.photo_id=v.photo_id "
+                        "WHERE v.group_id=?)")
+                sql_params.append(self.api.group_id)
+            sql += " ORDER BY p.upload_epoch DESC, p.photo_id LIMIT 4000"
+            rows = self.api.store.query(sql, sql_params)
             out = []
             for row in rows:
                 if photo_ids is not None and row["photo_id"] not in set(photo_ids):
@@ -1064,16 +1172,17 @@ class Handler(BaseHTTPRequestHandler):
                 out.append(item)
                 if len(out) >= pool_k:
                     break
-            items = self._ai_sort(out, sort if sort != "relevance" else "newest")[:top_k]
+            items = finish(out, "newest" if sort == "relevance" else sort)
             return self._json({"mode": mode, "total": len(items), "items": items,
-                               "filters": filters, "sort": sort, "ai_tags": ai_tag_ids})
+                               "filters": filters, "sort": sort, "media": media,
+                               "ai_tags": ai_tag_ids})
 
         items = self._ai_tag_filter(items, ai_tag_ids, min_conf)
         decorated = self._decorate_results(items)
-        decorated = self._ai_sort(decorated, sort)[:top_k]
+        decorated = finish(decorated)
         return self._json({"mode": mode, "total": len(decorated), "items": decorated,
                            "query": query, "similar_to": similar_to, "sort": sort,
-                           "filters": filters, "ai_tags": ai_tag_ids})
+                           "media": media, "filters": filters, "ai_tags": ai_tag_ids})
 
     def _ai_tag_filter(self, items: List[Dict[str, Any]], ai_tag_ids: List[int],
                        min_conf: float) -> List[Dict[str, Any]]:
@@ -1112,13 +1221,6 @@ class Handler(BaseHTTPRequestHandler):
         # relevance
         return sorted(items, key=lambda x: (-(x.get("score") or 0.0),
                                             -(x.get("vector_score") or 0.0), x["photo_id"]))
-
-    def _ai_payload(self, mode: str, items: List[Dict[str, Any]], top_k: int, sort: str, **extra):
-        decorated = self._decorate_results(items)
-        decorated = self._ai_sort(decorated, sort)[:top_k]
-        payload = {"mode": mode, "total": len(decorated), "items": decorated, "sort": sort}
-        payload.update(extra)
-        return payload
 
     def _api_post(self, path: str, payload: Dict[str, Any]) -> None:
         api = self.api

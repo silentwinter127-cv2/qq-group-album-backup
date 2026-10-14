@@ -174,15 +174,33 @@ def parse_media_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     cover = video.get("cover") if isinstance(video.get("cover"), dict) else {}
     cover_url = _first_url(cover.get("photoUrls"), prefer=(2, 3, 1)) or str(cover.get("url") or "")
+    # ⚠️ 时长字段叫 videoTime，而且挂在**外层 media 项**上（毫秒）——
+    # video 对象里没有 time/duration，之前按那两个名字取，结果一直是空的。
+    duration = 0
+    for source in (item, video):
+        for key in ("videoTime", "video_time", "duration", "time"):
+            value = source.get(key)
+            if value:
+                try:
+                    duration = int(value)
+                except (TypeError, ValueError):
+                    duration = 0
+                if duration:
+                    break
+        if duration:
+            break
     return {
         "video_id": str(video.get("id") or "").strip(),
         # lloc 用封面地址里的 pickey，才能和 photos.lloc 对上（见 pickey_from_cover）
         "lloc": pickey_from_cover(cover_url) or str(cover.get("lloc") or item.get("lloc") or ""),
         "width": int(video.get("width") or item.get("width") or 0) or None,
         "height": int(video.get("height") or item.get("height") or 0) or None,
-        "duration_ms": int(video.get("time") or video.get("duration") or 0) or None,
+        "duration_ms": duration or None,
         "cover_url": cover_url,
         "video_url": str(video.get("url") or ""),
+        # 发布者/时间也能从 media 项上拿到，存下来避免只依赖封面照片
+        "uploader_uin": str(item.get("uploader") or ""),
+        "upload_epoch": int(item.get("uploadTime") or 0) or None,
         "raw": item,
     }
 

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from urllib import request as urlrequest
 
@@ -35,7 +36,8 @@ from qqalbum.js_bridge import (batch_id_of, build_attach_info, flatten_feed,  # 
 from qqalbum.qzone import normalize_adapter_feed  # noqa: E402
 from qqalbum.store import Store, epoch_to_text  # noqa: E402
 from qqalbum.video import parse_media_item, pickey_from_cover  # noqa: E402
-from qqalbum.web import Api, _csv_cell  # noqa: E402
+from qqalbum.web import (Api, _csv_cell, annotate_video_covers,  # noqa: E402
+                         filter_by_media)  # noqa: E402
 
 G = "123456789"
 PHOTO_ID = "V5bCQA2ODQ2OTAyNTQr6chqhCznLg!!"
@@ -1098,6 +1100,140 @@ class VideoDownloaderTests(unittest.TestCase):
             fh.write(b"\x00\x00\x00 ftypisom" + b"x" * 100)
         res = self.dl.download_one(row, G)
         self.assertTrue(res.get("skipped"))
+
+
+class VideoCoverSearchTests(unittest.TestCase):
+    """视频 ↔ 封面照片绑定，以及"按封面搜视频"依赖的映射。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(os.path.join(self.tmp.name, "vc.sqlite3"))
+        self.store.upsert_photos(G, [
+            {"id": "Pvideo", "lloc": "Pvideo!!", "_album_id": "A1", "owner": "7",
+             "uploadtime": 100, "burl": "http://c/pv/200"},
+            {"id": "Pphoto", "lloc": "Pphoto!!", "_album_id": "A1", "owner": "7",
+             "uploadtime": 200, "burl": "http://c/pp/200"},
+        ])
+
+    def tearDown(self):
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def test_video_ids_for_photos(self):
+        self.store.upsert_videos(G, [{"video_id": "v1", "album_id": "A1", "lloc": "Pvideo!!"}])
+        self.store.link_videos_to_photos(G)
+        mapping = self.store.video_ids_for_photos(G, ["Pvideo", "Pphoto", "missing"])
+        self.assertEqual(mapping, {"Pvideo": "v1"})
+        self.assertEqual(self.store.video_ids_for_photos(G, []), {})
+
+    def test_photos_of_videos(self):
+        self.store.upsert_videos(G, [{"video_id": "v1", "album_id": "A1", "lloc": "Pvideo!!"}])
+        self.store.link_videos_to_photos(G)
+        self.assertEqual(self.store.photos_of_videos(G), ["Pvideo"])
+        self.assertEqual(self.store.photos_of_videos(G, album_id="OTHER"), [])
+
+    def test_videos_by_ids(self):
+        self.store.upsert_videos(G, [{"video_id": "v1", "album_id": "A1", "lloc": "L",
+                                      "video_url": "u", "duration_ms": 5000}])
+        got = self.store.videos_by_ids(G, ["v1", "nope"])
+        self.assertIn("v1", got)
+        self.assertEqual(got["v1"]["duration_ms"], 5000)
+        self.assertNotIn("raw_json", got["v1"])
+        self.assertEqual(self.store.videos_by_ids(G, []), {})
+
+    def test_videos_list_carries_cover_metadata(self):
+        """列表也要能显示发布者/互动数 —— 从封面照片补。"""
+        self.store.upsert_photos(G, [
+            {"id": "P1", "lloc": "P1!!", "_album_id": "A1", "owner": "42",
+             "uploadtime": 1700000000, "burl": "http://c/1/200"},
+        ])
+        self.store.upsert_videos(G, [{"video_id": "v1", "album_id": "A1", "lloc": "P1!!"}])
+        self.store.link_videos_to_photos(G)
+        rows = self.store.videos(G)["items"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["comment_count"], 0)
+        self.assertEqual(rows[0]["like_count"], 0)
+
+
+class VideoMediaFlagTests(unittest.TestCase):
+    """filter_by_media / annotate_video_covers 的分支（纯函数，直接调用）。"""
+
+    class _Store:
+        def __init__(self, mapping):
+            self.mapping = mapping
+
+        def video_ids_for_photos(self, group_id, photo_ids):
+            return {p: self.mapping[p] for p in photo_ids if p in self.mapping}
+
+        def videos_by_ids(self, group_id, video_ids):
+            return {v: {"video_id": v, "file_status": "done", "file_path": "/x.mp4",
+                        "duration_ms": 1000} for v in video_ids}
+
+    def _api(self, mapping):
+        return types.SimpleNamespace(group_id=G, store=self._Store(mapping))
+
+    def test_videos_only(self):
+        api = self._api({"pv": "v1"})
+        items = [{"photo_id": "pv"}, {"photo_id": "pp"}]
+        kept = filter_by_media(api, items, "videos")
+        self.assertEqual([i["photo_id"] for i in kept], ["pv"])
+        self.assertTrue(kept[0]["is_video_cover"])
+        self.assertEqual(kept[0]["video"]["video_id"], "v1")
+        self.assertTrue(kept[0]["video"]["has_file"])
+
+    def test_photos_only(self):
+        api = self._api({"pv": "v1"})
+        items = [{"photo_id": "pv"}, {"photo_id": "pp"}]
+        kept = filter_by_media(api, items, "photos")
+        self.assertEqual([i["photo_id"] for i in kept], ["pp"])
+        self.assertFalse(kept[0]["is_video_cover"])
+
+    def test_no_filter_keeps_everything(self):
+        api = self._api({"pv": "v1"})
+        items = [{"photo_id": "pv"}, {"photo_id": "pp"}]
+        self.assertEqual(len(filter_by_media(api, items, "")), 2)
+
+    def test_annotate_marks_only_covers(self):
+        api = self._api({"pv": "v1"})
+        items = [{"photo_id": "pv"}, {"photo_id": "pp"}]
+        annotated = annotate_video_covers(api, items)
+        self.assertTrue(annotated[0]["is_video_cover"])
+        self.assertFalse(annotated[1]["is_video_cover"])
+        self.assertNotIn("video", annotated[1])
+
+    def test_no_videos_still_flags_everything_false(self):
+        api = self._api({})
+        items = [{"photo_id": "pp"}]
+        annotate_video_covers(api, items)
+        self.assertFalse(items[0]["is_video_cover"])
+
+
+class VideoUpsertKeepsDataTests(unittest.TestCase):
+    """重新采集视频元数据不能把已有字段抹掉。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(os.path.join(self.tmp.name, "vu.sqlite3"))
+
+    def tearDown(self):
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def test_upload_epoch_not_blanked(self):
+        self.store.upsert_videos(G, [{"video_id": "v1", "upload_epoch": 1700000000,
+                                      "uploader_uin": "42"}])
+        # 第二次采集没带 uploadTime → 不能把时间/上传者抹成 NULL
+        self.store.upsert_videos(G, [{"video_id": "v1", "duration_ms": 9000}])
+        row = self.store.query_one("SELECT * FROM videos WHERE video_id=?", ("v1",))
+        self.assertEqual(row["upload_epoch"], 1700000000)
+        self.assertEqual(row["uploader_uin"], "42")
+        self.assertEqual(row["duration_ms"], 9000)
 
 
 if __name__ == "__main__":
