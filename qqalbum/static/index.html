@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>QQ 群相册备份 · 本地浏览</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">QQ</div>
+      <div>
+        <div class="brand-title">群相册备份</div>
+        <div class="brand-sub" id="brandSub">本地离线浏览</div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button class="nav-item active" data-view="albums"><span>🗂</span>相册总览</button>
+      <button class="nav-item" data-view="photos"><span>🖼</span>全部照片</button>
+      <button class="nav-item" data-view="videos"><span>🎬</span>视频</button>
+      <button class="nav-item" data-view="ai"><span>✨</span>AI 语义检索</button>
+      <button class="nav-item" data-view="uploaders"><span>👤</span>上传者</button>
+      <button class="nav-item" data-view="comments"><span>💬</span>评论流</button>
+      <button class="nav-item" data-view="gallery"><span>🎞</span>随机精选</button>
+      <button class="nav-item" data-view="timeline"><span>📈</span>时间线</button>
+    </nav>
+
+    <div class="panel">
+      <div class="panel-title">AI 索引（SigLIP2）</div>
+      <div class="kv" id="aiInfo">未启用</div>
+      <button class="btn primary block" id="btnAiIndex">建立 / 继续 AI 索引</button>
+      <button class="btn block" id="btnAiRetag">重新打标（全部重算）</button>
+      <div class="panel-title" style="margin-top:12px">图片描述（BLIP）</div>
+      <div class="kv" id="captionInfo">未启用</div>
+      <button class="btn block" id="btnCaption">生成 / 继续图片描述</button>
+      <button class="btn block" id="btnRecaption">重新生成描述</button>
+      <button class="btn ghost block" id="btnAiCancel">停止 AI 任务</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">备份</div>
+      <label class="check"><input type="checkbox" id="optAlbums" checked> 相册列表</label>
+      <label class="check"><input type="checkbox" id="optPhotos" checked> 照片元数据</label>
+      <label class="check"><input type="checkbox" id="optFeeds" checked> 评论 / 点赞 / 动态</label>
+      <label class="check"><input type="checkbox" id="optMembers" checked> 群成员昵称</label>
+      <label class="check"><input type="checkbox" id="optIncremental" checked> 增量（跳过已抓取）</label>
+      <button class="btn primary block" id="btnSync">开始抓取元数据</button>
+      <button class="btn block" id="btnDownload">下载原图（未完成的）</button>
+      <label class="check"><input type="checkbox" id="optVideos" checked> 视频元数据（需 QQ Agent 运行）</label>
+      <button class="btn block" id="btnVideoDownload">下载视频（未完成的）</button>
+      <button class="btn block" id="btnConnect">连接 / 检查登录</button>
+      <button class="btn ghost block" id="btnCancel">取消当前任务</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">数据库</div>
+      <div class="kv" id="dbInfo">—</div>
+      <div class="panel-title" style="margin-top:10px">导出</div>
+      <div class="row">
+        <a class="btn tiny" href="/api/csv">CSV</a>
+        <a class="btn tiny" href="/api/export">JSON</a>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="search">
+        <span>🔍</span>
+        <input id="searchInput" placeholder="搜索描述 / 上传者 / 评论内容 / 照片ID…" />
+      </div>
+      <select id="orderSelect" class="select">
+        <option value="upload_desc">最新上传</option>
+        <option value="upload_asc">最早上传</option>
+        <option value="comments">评论最多</option>
+        <option value="likes">点赞最多</option>
+        <option value="album">按相册</option>
+      </select>
+      <button class="btn tiny" id="btnRefresh">刷新</button>
+      <div class="status" id="statusPill">就绪</div>
+    </header>
+
+    <section class="progress-bar hidden" id="progressWrap">
+      <div class="progress-fill" id="progressFill"></div>
+      <div class="progress-text" id="progressText"></div>
+    </section>
+
+    <section class="view" id="view"></section>
+  </main>
+</div>
+
+<div class="modal hidden" id="modal">
+  <div class="modal-backdrop" data-close="1"></div>
+  <div class="modal-body">
+    <div class="modal-media">
+      <img id="modalImg" alt="" />
+      <div class="modal-nav">
+        <button class="btn tiny" id="prevPhoto">← 上一张</button>
+        <span id="modalCounter" class="muted"></span>
+        <button class="btn tiny" id="nextPhoto">下一张 →</button>
+      </div>
+    </div>
+    <div class="modal-side">
+      <div class="modal-head">
+        <div>
+          <h3 id="modalTitle">照片详情</h3>
+          <div class="muted" id="modalSub"></div>
+        </div>
+        <button class="btn tiny ghost" data-close="1">关闭</button>
+      </div>
+      <div class="meta-grid" id="modalMeta"></div>
+      <div class="caption-block" id="modalCaptionWrap" style="display:none">
+        <div class="panel-title">图片描述</div>
+        <div class="caption-text" id="modalCaption"></div>
+      </div>
+      <div class="tags-block">
+        <div class="panel-title">分类标签</div>
+        <div class="tag-row" id="modalTags"></div>
+        <div class="row">
+          <input class="input" id="newTagInput" placeholder="新建标签…" />
+          <button class="btn tiny" id="btnAddTag">新建</button>
+        </div>
+      </div>
+      <div class="tags-block">
+        <div class="panel-title">AI 标签（SigLIP2）</div>
+        <div class="tag-row" id="modalAiTags"></div>
+        <button class="btn tiny block" id="btnSimilar">找出相似图片</button>
+      </div>
+      <div class="comments-block">
+        <div class="panel-title">评论 <span id="commentCount" class="muted"></span></div>
+        <div id="modalComments" class="comment-list"></div>
+      </div>
+      <div class="comments-block">
+        <div class="panel-title">点赞 <span id="likeCount" class="muted"></span></div>
+        <div id="modalLikes" class="like-list"></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <a class="btn tiny" id="modalDownload" href="#" download>下载原图</a>
+        <a class="btn tiny ghost" id="modalRaw" href="#" target="_blank">原始链接</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

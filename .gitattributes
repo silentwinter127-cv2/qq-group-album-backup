@@ -1,0 +1,9 @@
+# 源码统一 LF；Windows 批处理必须 CRLF，否则 cmd.exe 会把脚本拆成乱码
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.png binary
+*.jpg binary
+*.gif binary
+*.zip binary

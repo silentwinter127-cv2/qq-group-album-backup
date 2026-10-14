@@ -1,0 +1,23 @@
+# ---- runtime data: never commit these ----
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+photos/
+videos/
+_thumbs/
+_covers/
+edge-profile/
+
+# logs / scratch
+*.log
+*.part
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# local machine specifics
+group.txt
+.env
+*.local
