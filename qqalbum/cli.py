@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import signal
+import socket
 import sys
 import threading
 import time
@@ -15,7 +17,33 @@ from .crawler import BackupManager
 from .qzone import DEFAULT_PROFILE, QzoneClient
 from .siglip import SiglipEngine, SiglipUnavailable
 from .store import DEFAULT_DB, Store
-from .web import Api, find_free_port, serve
+from .web import Api, Auth, find_free_port, serve
+
+
+def _lan_addresses() -> list:
+    """本机在局域网里的 IPv4 地址（给别人用的访问地址）。"""
+    found = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            addr = info[4][0]
+            if ":" in addr or addr.startswith("127."):
+                continue
+            if addr not in found:
+                found.append(addr)
+    except Exception:
+        pass
+    if not found:
+        # 退路：连一个外部地址看看本机走哪个网卡（不会真的发包）
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect(("8.8.8.8", 80))
+                found.append(sock.getsockname()[0])
+            finally:
+                sock.close()
+        except Exception:
+            pass
+    return found
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,7 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=None, help="图片与缓存根目录（默认与数据库同目录）")
     parser.add_argument("--profile", default=DEFAULT_PROFILE, help="浏览器用户数据目录（保存登录态）")
     parser.add_argument("--port", type=int, default=8787, help="WebUI 端口（默认 8787，自动避让占用）")
-    parser.add_argument("--host", default="127.0.0.1", help="WebUI 监听地址")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="WebUI 监听地址（默认 127.0.0.1 只有本机能连；"
+                             "要让别人访问用 --host 0.0.0.0，此时必须有口令）")
+    parser.add_argument("--password", default=None,
+                        help="访问口令（也可用环境变量 QQALBUM_PASSWORD）。"
+                             "只在 --host 不是 127.0.0.1 时才需要；"
+                             "不提供会自动生成一个并打印出来")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="关闭口令验证。⚠️ 只有确实绑在 127.0.0.1（或你完全信任整个网络）时再用，"
+                             "否则群成员昵称/QQ 号/全部照片对同网段任何人可见")
     parser.add_argument("--browser", default=None, help="Edge/Chrome 可执行文件路径")
     parser.add_argument("--headless", action="store_true", help="无头模式（登录后可用）")
     parser.add_argument("--workers", type=int, default=4, help="下载并发数（默认 4）")
@@ -113,8 +150,36 @@ def main(argv: Optional[list] = None) -> int:
             caption_engine = CaptionEngine.instance(args.caption_dir)
         except CaptionUnavailable as exc:
             print(f"[warn] BLIP 描述模型不可用：{exc}", file=sys.stderr)
+    # ------------------------------------------------ 访问口令（对外访问的前提）
+    # 这个界面能看到群里其他人的昵称、QQ 号、全部照片和评论原文，
+    # 所以只要不是只绑本机，就必须有口令 —— 否则同网段谁打开都能看。
+    exposed = args.host not in ("127.0.0.1", "localhost", "::1")
+    auth = None
+    if args.no_auth:
+        if exposed:
+            print("", file=sys.stderr)
+            print("⚠️  你用了 --no-auth 并且监听地址是 "
+                  f"{args.host}（不是本机回环）。", file=sys.stderr)
+            print("    这意味着同一网络里的任何人都能直接看到：", file=sys.stderr)
+            print("      · 本群全部成员的昵称与 QQ 号", file=sys.stderr)
+            print("      · 全部照片原图、评论与点赞原文", file=sys.stderr)
+            print("    如果这不是你想要的，去掉 --no-auth 重新启动。", file=sys.stderr)
+            print("", file=sys.stderr)
+    else:
+        password = args.password or os.environ.get("QQALBUM_PASSWORD") or ""
+        generated = False
+        if not password and exposed:
+            # 绑对外却没给口令：不要让服务"裸奔"，自动生成一个并明确打印
+            password = secrets.token_urlsafe(6)
+            generated = True
+        if password:
+            auth = Auth(password)
+        elif not exposed:
+            # 只绑本机时默认不启用口令，保持原来的使用体验
+            auth = None
+
     api = Api(store, manager, group_id, root_dir, engine=engine, model_dir=args.siglip_dir,
-              caption_engine=caption_engine, caption_dir=args.caption_dir)
+              caption_engine=caption_engine, caption_dir=args.caption_dir, auth=auth)
 
     print(f"群号        : {group_id}")
     print(f"数据库      : {db_path}")
@@ -185,6 +250,20 @@ def main(argv: Optional[list] = None) -> int:
     port = find_free_port(args.port, args.host)
     httpd, url = serve(api, host=args.host, port=port, open_browser=not args.no_open)
     print(f"WebUI       : {url}")
+    if auth is not None:
+        print("访问口令    : 已启用（浏览器首次打开会让你输入）")
+        if generated:
+            print(f"本次口令    : {password}")
+            print("              ↑ 自动生成的，请记下来；想固定就用 --password 或设环境变量 "
+                  "QQALBUM_PASSWORD")
+    elif exposed:
+        print("访问口令    : ⚠️ 已关闭（--no-auth），任何能连到你电脑的人都能看全部内容")
+    if exposed:
+        lan_ips = _lan_addresses()
+        if lan_ips:
+            print("局域网访问  : " + "  ".join(f"http://{ip}:{port}/" for ip in lan_ips))
+        print("对外访问    : 见 README「让其他人访问」一节（推荐 Tailscale 或 Cloudflare Tunnel）")
+        print("注意        : 防火墙需要放行该端口，否则别人连不上。")
     print("提示        : 首次使用需在弹出的 Edge 窗口里扫码登录 QQ 空间；登录态保存在浏览器配置目录。")
     print("按 Ctrl+C 退出。")
 

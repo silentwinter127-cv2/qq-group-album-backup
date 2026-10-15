@@ -39,6 +39,11 @@ async function api(path, options) {
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = { error: text.slice(0, 300) }; }
+  if (res.status === 401 && data && data.auth_required) {
+    // 会话过期（服务重启或超过 12 小时）：回登录页，别把一堆"需要登录"当错误抛给用户
+    location.replace('/login.html');
+    throw new Error('需要重新登录');
+  }
   if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
   return data;
 }

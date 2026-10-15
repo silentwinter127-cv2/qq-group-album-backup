@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>需要口令 · 群相册备份</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0b0e13; color: #e6edf6;
+    font: 15px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  .card {
+    width: min(400px, calc(100vw - 40px)); padding: 30px 28px 26px;
+    background: #12161f; border: 1px solid #232a38; border-radius: 14px;
+    box-shadow: 0 18px 50px rgba(0,0,0,.45);
+  }
+  h1 { margin: 0 0 6px; font-size: 19px; font-weight: 600; }
+  p.sub { margin: 0 0 20px; color: #93a1b5; font-size: 13px; }
+  label { display: block; font-size: 13px; color: #93a1b5; margin-bottom: 7px; }
+  input {
+    width: 100%; padding: 11px 13px; font-size: 15px; color: #e6edf6;
+    background: #0d1117; border: 1px solid #2b3444; border-radius: 9px; outline: none;
+  }
+  input:focus { border-color: #4a7ddb; box-shadow: 0 0 0 3px rgba(74,125,219,.18); }
+  button {
+    width: 100%; margin-top: 16px; padding: 11px; font-size: 15px; font-weight: 600;
+    color: #fff; background: #3b6fd4; border: 0; border-radius: 9px; cursor: pointer;
+  }
+  button:hover { background: #4a7ddb; }
+  button:disabled { opacity: .6; cursor: default; }
+  .err {
+    margin-top: 14px; padding: 9px 11px; font-size: 13px; border-radius: 8px;
+    background: rgba(220,80,80,.12); border: 1px solid rgba(220,80,80,.35); color: #ffb4b4;
+    display: none;
+  }
+  .hint { margin-top: 18px; font-size: 12px; color: #6c7a90; line-height: 1.7; }
+  code { background: #0d1117; border: 1px solid #232a38; border-radius: 5px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+  <form class="card" id="form" autocomplete="on">
+    <h1>🔒 需要访问口令</h1>
+    <p class="sub">这个界面能看到群成员信息与全部照片，所以加了口令。</p>
+    <label for="pw">口令</label>
+    <input id="pw" name="password" type="password" autocomplete="current-password"
+           autofocus required>
+    <button id="go" type="submit">进入</button>
+    <div class="err" id="err"></div>
+    <div class="hint">
+      口令在启动服务的那台电脑上：启动时会打印，或用 <code>--password</code> /
+      环境变量 <code>QQALBUM_PASSWORD</code> 指定。
+    </div>
+  </form>
+<script>
+  const form = document.getElementById('form');
+  const pw = document.getElementById('pw');
+  const go = document.getElementById('go');
+  const err = document.getElementById('err');
+
+  function showError(msg) {
+    err.textContent = msg;
+    err.style.display = 'block';
+  }
+
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    err.style.display = 'none';
+    go.disabled = true;
+    go.textContent = '验证中…';
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw.value }),
+      });
+      let data = {};
+      try { data = await res.json(); } catch (e) { /* 非 JSON 响应 */ }
+      if (res.ok && data.ok) {
+        // 登录成功：整页跳回主界面，让所有接口带上新 cookie
+        location.replace('/');
+        return;
+      }
+      showError(data.error || (res.status === 429 ? '尝试过于频繁，请稍后再试' : '登录失败'));
+    } catch (e) {
+      showError('无法连接服务：' + e.message);
+    }
+    go.disabled = false;
+    go.textContent = '进入';
+    pw.select();
+  });
+</script>
+</body>
+</html>

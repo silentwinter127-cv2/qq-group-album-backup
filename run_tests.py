@@ -36,8 +36,8 @@ from qqalbum.js_bridge import (batch_id_of, build_attach_info, flatten_feed,  # 
 from qqalbum.qzone import normalize_adapter_feed  # noqa: E402
 from qqalbum.store import Store, epoch_to_text  # noqa: E402
 from qqalbum.video import parse_media_item, pickey_from_cover  # noqa: E402
-from qqalbum.web import (Api, _csv_cell, annotate_video_covers,  # noqa: E402
-                         filter_by_media)  # noqa: E402
+from qqalbum.web import (Api, Auth, _csv_cell,  # noqa: E402
+                         annotate_video_covers, filter_by_media)  # noqa: E402
 
 G = "123456789"
 PHOTO_ID = "V5bCQA2ODQ2OTAyNTQr6chqhCznLg!!"
@@ -1340,6 +1340,85 @@ class TimeAxisTests(unittest.TestCase):
         self.assertIn("is_video_cover", items[0])
         self.assertTrue(items[0]["is_video_cover"])
         self.assertEqual(items[0]["video_id"], "v1")
+
+
+class AuthTests(unittest.TestCase):
+    """口令登录：正确性、时序安全、会话有效期、失败限速。"""
+
+    def test_wrong_password_rejected(self):
+        auth = Auth("correct-horse")
+        self.assertIsNone(auth.login("wrong"))
+        self.assertIsNone(auth.login(""))
+        self.assertIsNone(auth.login("correct-hors"))   # 差一个字符也不行
+
+    def test_correct_password_issues_valid_session(self):
+        auth = Auth("hunter2")
+        token = auth.login("hunter2")
+        self.assertTrue(token)
+        self.assertTrue(auth.valid(token))
+        self.assertFalse(auth.valid(token + "x"))
+        self.assertFalse(auth.valid(""))
+        self.assertFalse(auth.valid(None))
+
+    def test_sessions_are_unique(self):
+        auth = Auth("pw")
+        a, b = auth.login("pw"), auth.login("pw")
+        self.assertNotEqual(a, b)
+        self.assertTrue(auth.valid(a) and auth.valid(b))
+
+    def test_logout_invalidates(self):
+        auth = Auth("pw")
+        token = auth.login("pw")
+        auth.logout(token)
+        self.assertFalse(auth.valid(token))
+
+    def test_expired_session_invalid(self):
+        auth = Auth("pw")
+        token = auth.login("pw")
+        auth._sessions[token] = time.time() - 1     # 手动过期
+        self.assertFalse(auth.valid(token))
+
+    def test_password_not_stored_in_plaintext(self):
+        auth = Auth("sup3r-s3cret")
+        self.assertNotIn(b"sup3r-s3cret", auth.password_hash)
+        self.assertNotIn("sup3r-s3cret", repr(auth.password_hash))
+
+    def test_rate_limit_kicks_in(self):
+        auth = Auth("pw")
+        ip = "10.0.0.9"
+        for _ in range(Auth.MAX_FAILS):
+            self.assertEqual(auth.penalty(ip), 0.0)   # 前几次不罚
+            auth.note_failure(ip)
+        self.assertGreater(auth.penalty(ip), 0)       # 到阈值后开始延迟
+        first = auth.penalty(ip)
+        auth.note_failure(ip)
+        self.assertGreater(auth.penalty(ip), first)   # 继续失败继续加长
+
+    def test_rate_limit_is_per_ip(self):
+        auth = Auth("pw")
+        for _ in range(Auth.MAX_FAILS + 3):
+            auth.note_failure("1.1.1.1")
+        self.assertGreater(auth.penalty("1.1.1.1"), 0)
+        self.assertEqual(auth.penalty("2.2.2.2"), 0)  # 别人不受影响
+
+    def test_success_clears_penalty(self):
+        auth = Auth("pw")
+        ip = "10.0.0.9"
+        for _ in range(Auth.MAX_FAILS + 2):
+            auth.note_failure(ip)
+        self.assertGreater(auth.penalty(ip), 0)
+        auth.note_success(ip)
+        self.assertEqual(auth.penalty(ip), 0.0)
+
+    def test_cookie_flags(self):
+        auth = Auth("pw")
+        plain = auth.cookie_header("tok", secure=False)
+        self.assertIn("HttpOnly", plain)
+        self.assertIn("SameSite=Lax", plain)
+        # ⚠️ 非 HTTPS 时不能加 Secure，否则浏览器不回传 cookie，会一直弹登录框
+        self.assertNotIn("Secure", plain)
+        https = auth.cookie_header("tok", secure=True)
+        self.assertIn("Secure", https)
 
 
 if __name__ == "__main__":

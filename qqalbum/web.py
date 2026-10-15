@@ -1,10 +1,13 @@
 """Dependency-free HTTP server: JSON API + static WebUI + media serving."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -36,7 +39,8 @@ class Api:
 
     def __init__(self, store: Store, manager: BackupManager, group_id: str, root_dir: str,
                  engine=None, model_dir: Optional[str] = None,
-                 caption_engine=None, caption_dir: Optional[str] = None):
+                 caption_engine=None, caption_dir: Optional[str] = None,
+                 auth: Optional["Auth"] = None):
         self.store = store
         self.manager = manager
         self.group_id = str(group_id)
@@ -45,6 +49,8 @@ class Api:
         self._engine = engine
         self.caption_dir = caption_dir
         self._caption_engine = caption_engine
+        # None = 不启用口令（只绑 127.0.0.1 时的默认）
+        self.auth = auth
         self.indexer: Optional[AiIndexer] = None
         self.captioner: Optional[CaptionIndexer] = None
         self._searcher: Optional[AiSearch] = None
@@ -610,6 +616,91 @@ def filter_by_media(api: Any, items: List[Dict[str, Any]], media: str) -> List[D
     return [i for i in annotated if not i.get("is_video_cover")]
 
 
+class Auth:
+    """口令登录 + 会话 cookie。
+
+    为什么要做这个：这个服务能看到**群里其他人的**昵称、QQ 号、全部照片和评论原文。
+    它本来只绑 127.0.0.1，所以以前不需要验证；一旦要让别人访问（局域网或内网穿透），
+    没有验证就等于把这些内容公开 —— 所以放开的**前提**是先把这道门装上。
+
+    设计取舍：
+    - 口令用 PBKDF2 存哈希、比较用 hmac.compare_digest（防时序侧信道）；
+    - 会话是内存里的随机 token，重启即失效（这种本地工具不需要持久会话）；
+    - 每个 IP 统计连续失败次数并递增延迟，防口令暴破（会话 token 本身猜不出来）；
+    - cookie 默认 HttpOnly + SameSite=Lax；只有在**确实走 HTTPS** 时才加 Secure，
+      否则通过 http 访问时浏览器不会回传 cookie，会变成"登录了但一直弹登录框"。
+    """
+
+    COOKIE = "qqalbum_session"
+    SESSION_TTL = 12 * 3600          # 12 小时
+    MAX_FAILS = 5                    # 连续失败这么多次后开始延迟
+
+    def __init__(self, password: str, log: Optional[Callable[[str], None]] = None) -> None:
+        self.password_hash = self._hash(password)
+        self.log = log or (lambda _m: None)
+        self._sessions: Dict[str, float] = {}      # token -> 过期时间戳
+        self._fails: Dict[str, List[float]] = {}   # ip -> 失败时间列表
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _hash(password: str) -> bytes:
+        salt = b"qqalbum-local-ui"      # 本地单人使用，盐固定即可（不是多用户系统）
+        return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+
+    # ---------------------------------------------------------------- sessions
+    def login(self, password: str) -> Optional[str]:
+        if not hmac.compare_digest(self._hash(password), self.password_hash):
+            return None
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sessions[token] = time.time() + self.SESSION_TTL
+        return token
+
+    def valid(self, token: Optional[str]) -> bool:
+        if not token:
+            return False
+        now = time.time()
+        with self._lock:
+            # 顺手清掉过期的，避免长期运行越攒越多
+            for key in [k for k, exp in self._sessions.items() if exp < now]:
+                self._sessions.pop(key, None)
+            exp = self._sessions.get(token)
+        return bool(exp and exp > now)
+
+    def logout(self, token: Optional[str]) -> None:
+        if token:
+            with self._lock:
+                self._sessions.pop(token, None)
+
+    # ------------------------------------------------------------ rate limit
+    def penalty(self, ip: str) -> float:
+        """这个 IP 当前要等多少秒才能再试（失败越多等越久）。"""
+        now = time.time()
+        with self._lock:
+            fails = [t for t in self._fails.get(ip, []) if now - t < 300]
+            self._fails[ip] = fails
+            count = len(fails)
+        if count < self.MAX_FAILS:
+            return 0.0
+        # 第 5 次开始每次 +2 秒，最多 60 秒
+        return float(min(60, (count - self.MAX_FAILS + 1) * 2))
+
+    def note_failure(self, ip: str) -> None:
+        with self._lock:
+            self._fails.setdefault(ip, []).append(time.time())
+
+    def note_success(self, ip: str) -> None:
+        with self._lock:
+            self._fails.pop(ip, None)
+
+    def cookie_header(self, token: str, secure: bool) -> str:
+        parts = [f"{self.COOKIE}={token}", "Path=/", "HttpOnly", "SameSite=Lax",
+                 f"Max-Age={self.SESSION_TTL}"]
+        if secure:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "QQAlbumBackup/1.0"
     api: Api = None  # type: ignore
@@ -690,13 +781,103 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
 
     # ------------------------------------------------------------------ verbs
+    # ------------------------------------------------------------------ auth
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "?"
+
+    def _is_secure_request(self) -> bool:
+        """是不是 HTTPS（穿透/反代后面可能是）。只有确定是 HTTPS 才给 cookie 加 Secure。"""
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            return True
+        if self.headers.get("X-Forwarded-Ssl", "").lower() == "on":
+            return True
+        return False
+
+    def _session_token(self) -> str:
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == Auth.COOKIE and value:
+                return value.strip()
+        return ""
+
+    def _auth_required(self) -> bool:
+        return self.api.auth is not None
+
+    def _authed(self) -> bool:
+        if not self._auth_required():
+            return True
+        return self.api.auth.valid(self._session_token())
+
+    def _need_login(self) -> None:
+        """未登录：接口返回 401，页面返回登录页。"""
+        accept = (self.headers.get("Accept") or "")
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/api/"):
+            return self._json({"error": "需要登录", "auth_required": True}, 401)
+        if "text/html" in accept or path == "/" or path == "/index.html":
+            return self._file(os.path.join(STATIC_DIR, "login.html"), cache=False)
+        return self._json({"error": "需要登录", "auth_required": True}, 401)
+
+    def _handle_login(self) -> None:
+        payload = self._read_json()
+        password = str(payload.get("password") or "")
+        ip = self._client_ip()
+        # ⚠️ 顺序很重要：**先验口令，再罚失败**。
+        #    反过来的话，别人拿错口令刷几次就能把合法用户一起挡在门外
+        #    （限速是按 IP 的，本机和攻击者 NAT 后面可能是同一个 IP），
+        #    这等于给了对方一个拒绝服务的开关。正确口令永远放行。
+        token = self.api.auth.login(password)
+        if token is None:
+            self.api.auth.note_failure(ip)
+            # 注意顺序：先记这次失败再问罚多久，否则恰好到阈值的那一次不会被拒
+            wait = self.api.auth.penalty(ip)
+            if wait > 0:
+                return self._json(
+                    {"error": f"口令不对；尝试过于频繁，请等 {wait:.0f} 秒后再试"}, 429)
+            fails = len(self.api.auth._fails.get(ip, []))
+            left = max(0, Auth.MAX_FAILS - fails)
+            hint = f"（再失败 {left} 次将开始延迟）" if left else ""
+            return self._json({"error": "口令不对" + hint}, 401)
+        self.api.auth.note_success(ip)
+        secure = self._is_secure_request()
+        body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie", self.api.auth.cookie_header(token, secure))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_logout(self) -> None:
+        self.api.auth.logout(self._session_token())
+        body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie",
+                         f"{Auth.COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
         try:
+            # 口令登录页要能匿名拿到，否则登录框都出不来。
+            # /api/health 也放行：自启动脚本、机器人技能靠它探活，它们没有会话。
+            public = path in ("/login.html", "/api/health")
+            if not public and not self._authed():
+                return self._need_login()
+            if path == "/api/auth-state":
+                return self._json({"auth_required": self._auth_required(),
+                                   "authed": self._authed()})
             if path.startswith("/api/"):
                 return self._api_get(path, params)
+            if path == "/login.html":
+                return self._file(os.path.join(STATIC_DIR, "login.html"), cache=False)
             if path == "/" or path == "/index.html":
                 return self._file(os.path.join(STATIC_DIR, "index.html"), cache=False)
             if path.startswith("/static/"):
@@ -719,6 +900,14 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         content_type = self.headers.get("Content-Type") or ""
         try:
+            if parsed.path == "/api/login":
+                if not self._auth_required():
+                    return self._json({"ok": True, "note": "未启用口令"})
+                return self._handle_login()
+            if not self._authed():
+                return self._need_login()
+            if parsed.path == "/api/logout":
+                return self._handle_logout()
             if parsed.path == "/api/ai/search-image":
                 return self._api_search_image(content_type)
             if parsed.path == "/api/ai/index-image":
@@ -1341,7 +1530,10 @@ def serve(api: Api, host: str = "127.0.0.1", port: int = 8787,
     handler = type("BoundHandler", (Handler,), {"api": api})
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.daemon_threads = True
-    url = f"http://{host}:{port}/"
+    # 绑 0.0.0.0 时别把 "http://0.0.0.0:8787/" 当地址给浏览器 —— 那个地址打不开。
+    # 本机自己访问永远用 127.0.0.1；对外的地址由调用方打印。
+    shown = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    url = f"http://{shown}:{port}/"
 
     def _serve_forever() -> None:
         """把 serve_forever 包一层，异常绝不静默。
