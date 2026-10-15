@@ -17,7 +17,15 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-DEFAULT_PROFILE_DIR = r"D:\QQAlbumBackup\edge-profile"
+def _default_root() -> str:
+    env = os.environ.get("QQALBUM_ROOT")
+    if env:
+        return os.path.abspath(env)
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(here, "backup")
+
+
+DEFAULT_PROFILE_DIR = os.path.join(_default_root(), "edge-profile")
 
 _BROWSER_CANDIDATES = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",

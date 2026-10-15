@@ -5,20 +5,29 @@ cd /d "%~dp0"
 
 rem ============================================================
 rem  QQ group album local backup
-rem  Database and photos live in D:\QQAlbumBackup
+rem  Photos/videos and the database are written under the path given to
+rem  --db / --root (see README; default is next to this script).
 rem
 rem  Usage:
-rem     run_backup.bat                             -> group 123456789
+rem     run_backup.bat <group number> [options]
 rem     run_backup.bat 123456789 --port 8787
-rem     run_backup.bat 123456789 --caption         (resume captions on start)
+rem     run_backup.bat 123456789 --caption        (resume captions on start)
+rem
+rem  The group number is required: there is no built-in default, because a
+rem  backup tool has no business assuming which group you belong to.
 rem
 rem  NOTE: every argument after the group number is forwarded verbatim.
-rem  The old version passed only %2..%9 and swallowed flags like --port,
-rem  which made a hidden launcher start the service on the wrong port.
 rem ============================================================
 
 set GROUP=%~1
-if "%GROUP%"=="" set GROUP=123456789
+if "%GROUP%"=="" (
+  echo.
+  echo   [ERROR] group number required, e.g.  run_backup.bat 123456789
+  echo.
+  exit /b 2
+)
+if "%GROUP%"=="--help" goto :help
+if "%GROUP%"=="-h" goto :help
 
 rem Collect the rest without shift (shift would destroy the group value we
 rem just read): walk over all args, skip the first, keep the remainder.
@@ -33,8 +42,7 @@ for %%A in (%*) do (
 )
 
 echo ============================================
-echo  QQ album local backup  -  group %GROUP%
-echo  database + photos:  D:\QQAlbumBackup
+echo  QQ group album local backup  -  group %GROUP%
 echo ============================================
 echo.
 
@@ -47,3 +55,10 @@ if errorlevel 1 (
   echo          script, and a pause would hang there forever.)
 )
 endlocal
+exit /b 0
+
+:help
+echo Usage: run_backup.bat ^<group number^> [options]
+echo    e.g. run_backup.bat 123456789 --port 8787
+endlocal
+exit /b 0

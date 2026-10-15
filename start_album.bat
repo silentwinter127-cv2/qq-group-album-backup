@@ -11,13 +11,6 @@ rem     busy, while the QQ bot skill is configured for 8787 -- that shows up
 rem     as "service is running but the bot cannot connect".
 rem   So here: if the port is not ours, fail loudly. Never switch ports.
 rem
-rem  PASSWORD: the UI exposes other people's nicknames / QQ numbers, and this
-rem  machine may be published through a tunnel, so the service must carry a
-rem  password whenever it is reachable from outside. The value lives in
-rem  album_password.txt (generated on first run) and is read here -- never
-rem  hardcoded, so it cannot end up in the repository, and reading it from a
-rem  file also keeps it out of the process command line.
-rem
 rem  Usage:
 rem     start_album.bat <group number> [extra options]
 rem     start_album.bat 123456789
@@ -55,33 +48,13 @@ if /i "!STATE!"=="OTHER" (
   exit /b 1
 )
 
-rem --- password: read album_password.txt, generate it if missing -------------
-set QPASS=
-if exist "%~dp0album_password.txt" for /f "usebackq delims=" %%P in ("%~dp0album_password.txt") do set QPASS=%%P
-if not defined QPASS (
-  echo       no album_password.txt -- generating one ...
-  for /f "usebackq delims=" %%P in (`python "%~dp0tools\make_password.py" 2^>nul`) do set QPASS=%%P
-)
-if not defined QPASS (
-  echo.
-  echo       [ERROR] could not obtain a password; refusing to start.
-  echo       The interface would be reachable without one, which exposes
-  echo       other members' nicknames and QQ numbers.
-  echo.
-  pause
-  exit /b 1
-)
-
-echo [2/3] starting service (group !GROUP!, port !PORT!, password on) ...
+echo [2/3] starting service (group !GROUP!, port !PORT!) ...
 echo [3/3] closing this window stops the service.
 echo.
 echo WebUI: http://127.0.0.1:!PORT!/
 echo.
-echo If this machine is published through a tunnel, hand out that URL plus the
-echo password stored in album_password.txt.
-echo.
 
-python -m qqalbum !GROUP! --port !PORT! --password !QPASS! %*
+python -m qqalbum !GROUP! --port !PORT! %*
 
 if errorlevel 1 (
   echo.

@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="qqalbum",
         description="把 QQ 群相册的元数据（上传者/上传时间/评论/点赞）备份到本地 SQLite，"
                     "并下载原图，附带本地 WebUI 浏览与分类。")
-    parser.add_argument("group", nargs="?", default=None, help="QQ 群号，例如 123456789")
+    parser.add_argument("group", nargs="?", default=None, help="QQ 群号，例如 <群号>")
     parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite 数据库路径（默认 {DEFAULT_DB}）")
     parser.add_argument("--root", default=None, help="图片与缓存根目录（默认与数据库同目录）")
     parser.add_argument("--profile", default=DEFAULT_PROFILE, help="浏览器用户数据目录（保存登录态）")
@@ -126,7 +126,7 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     if not args.group:
-        print("请提供群号，例如： python -m qqalbum 123456789", file=sys.stderr)
+        print("请提供群号，例如： python -m qqalbum <群号>", file=sys.stderr)
         print("也可以先运行 --groups 查看已有备份。", file=sys.stderr)
         return 2
 

@@ -12,7 +12,7 @@ from qqalbum.qzone import QzoneClient  # noqa: E402
 from qqalbum.store import Store  # noqa: E402
 
 GROUP = sys.argv[1] if len(sys.argv) > 1 else "123456789"
-ROOT = r"D:\QQAlbumBackup"
+ROOT = r"<备份目录>"
 DB = os.path.join(ROOT, "qqalbum.sqlite3")
 MODE = sys.argv[2] if len(sys.argv) > 2 else "all"
 

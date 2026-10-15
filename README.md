@@ -45,7 +45,7 @@
 命中描述时直接显示那句话，两者按可配置权重（默认各 50%）混合排序。
 描述检索不依赖向量索引，即使还没建索引也能用。
 
-实测（群 123456789）：按相册标题做标注集验证，同一批照片用 4 个查询排序，
+实测（群 <群号>）：按相册标题做标注集验证，同一批照片用 4 个查询排序，
 每个查询都在自己的类别上取得最高分，**自身查询 top-1 命中率 75%**；
 以图搜图时同批次照片相似度 0.7~0.85，不同内容约 0.1，区分度良好。
 
@@ -55,7 +55,7 @@
 > 支持随时停止、之后再「继续」（已完成的不会重算）。
 
 
-### 实测结果（群 123456789）
+### 实测结果（群 <群号>）
 
 ```
 相册 78 · 照片 44,932 · 已下载原图/动图 43,304（8.3 GB）· 仅缩略图 1,628 · 失败 0
@@ -88,19 +88,19 @@ pip install pillow
 ## 3. 快速开始
 ```powershell
 cd C:\path\to\qq-group-album-backup
-python -m qqalbum 123456789
+python -m qqalbum <群号>
 ```
 
-或双击 `run_backup.bat`（默认群号 123456789，可传参：`run_backup.bat 123456`）。
+或双击 / 运行 `run_backup.bat <群号>`（群号必须自己传，详见 §3.1）。
 
 启动后：
 
-1. 程序自动拉起一个**独立的 Edge 窗口**（用户数据目录 `D:\QQAlbumBackup\edge-profile`），
+1. 程序自动拉起一个**独立的 Edge 窗口**（用户数据目录 `<备份目录>\edge-profile`），
    首次需要**手机 QQ 扫码登录**一次；登录态会长期保存在该目录。
    > 它使用独立配置目录，因此**不影响你日常使用的 Edge**，也不会读取你原配置里的登录态。
 2. 命令行打印 WebUI 地址（默认 <http://127.0.0.1:8787/>），浏览器会自动打开。
 3. 在左侧面板点击「**开始抓取元数据**」→ 抓取相册、照片、评论、点赞、成员。
-4. 再点击「**下载原图（未完成的）**」→ 把原图下载到 `D:\QQAlbumBackup\photos\<群号>\...`。
+4. 再点击「**下载原图（未完成的）**」→ 把原图下载到 `<备份目录>\photos\<群号>\...`。
 
 ### 3.1 开机自动启动（重启后机器人要能连上，就必须配）
 
@@ -134,7 +134,7 @@ Unregister-ScheduledTask -TaskName QQAlbumBackup-WebUI -Confirm:$false
 
 ```powershell
 curl http://127.0.0.1:8787/api/health
-# {"ok":true,"service":"qqalbum","group_id":"123456789","version":"QQAlbumBackup/1.0"}
+# {"ok":true,"service":"qqalbum","group_id":"<群号>","version":"QQAlbumBackup/1.0"}
 ```
 
 不碰数据库、不加载模型，可用它判断「服务起没起、是不是这个端口」。
@@ -149,7 +149,7 @@ curl http://127.0.0.1:8787/api/health
 ```
 POST http://127.0.0.1:3000/get_group_album_media_list
 Authorization: Bearer <令牌>
-{"group_id":123456789,"album_id":"<albumId>"}
+{"group_id":<群号>,"album_id":"<albumId>"}
 → mediaList 里视频项为 {"video":{"id":…,"url":"….mp4","cover":{…}}}
 ```
 
@@ -161,7 +161,7 @@ Authorization: Bearer <令牌>
   QQ Agent `/api/onebot-token` → QQ Agent `data/config.json` → SnowLuma `config/onebot_*.json`。
   都拿不到时明确报错，不会静默。
 - 视频地址**带签名会过期**（`dis_k`/`dis_t`），所以下载前会现场重取；遇到 403 自动换一条重试。
-- 文件落在 `D:\QQAlbumBackup\videos\<群号>\<相册ID>\<video_id>.mp4`，与照片目录并列。
+- 文件落在 `<备份目录>\videos\<群号>\<相册ID>\<video_id>.mp4`，与照片目录并列。
 - 视频**不参与 AI 检索**（SigLIP2 是图片模型），但它的封面照片在照片库里，
   可以用「视频」页看、按相册/已下载筛选、在线播放（支持拖动进度条）或「另存为」。
 - 同一个视频会挂在多个相册下，入库时按 `video_id` 去重；封面用地址里的 **pickey** 与
@@ -194,10 +194,10 @@ Authorization: Bearer <令牌>
 ## 4. 数据存放位置（D 盘）
 
 ```
-D:\QQAlbumBackup\
+<备份目录>\
 ├── qqalbum.sqlite3          # 全部元数据（相册/照片/评论/点赞/成员/原始 JSON）
 ├── photos\
-│   ├── 123456789\
+│   ├── <群号>\
 │   │   ├── <相册ID>\<上传者QQ>\<照片ID>.jpg     # 原图
 │   │   └── _thumbs\                             # 缩略图缓存（自动生成）
 │   └── _covers\                                 # 相册封面缓存
@@ -235,9 +235,9 @@ D:\QQAlbumBackup\
 ```
 python -m qqalbum <群号> [选项]
 
---db PATH         SQLite 路径（默认 D:\QQAlbumBackup\qqalbum.sqlite3）
+--db PATH         SQLite 路径（默认 <备份目录>\qqalbum.sqlite3）
 --root PATH       图片与缓存根目录（默认与数据库同目录）
---profile PATH    浏览器用户数据目录（默认 D:\QQAlbumBackup\edge-profile）
+--profile PATH    浏览器用户数据目录（默认 <备份目录>\edge-profile）
 --port N          WebUI 端口（默认 8787，占用时自动 +1 避让）
 --browser PATH    指定 Edge/Chrome 可执行文件
 --headless        无头模式（已登录后可用）
@@ -267,16 +267,16 @@ python -m qqalbum <群号> [选项]
 
 ```powershell
 # 只抓元数据并直接退出（跑批）
-python -m qqalbum 123456789 --no-web --sync
+python -m qqalbum <群号> --no-web --sync
 
 # 无头下载原图
-python -m qqalbum 123456789 --no-web --download --workers 8
+python -m qqalbum <群号> --no-web --download --workers 8
 
 # 建立 AI 索引（一次性，约 1 小时；也可在 WebUI 里点按钮）
-python -m qqalbum 123456789 --no-web --ai-index
+python -m qqalbum <群号> --no-web --ai-index
 
 # 只先索引 2000 张试试
-python -m qqalbum 123456789 --no-web --ai-index --ai-limit 2000
+python -m qqalbum <群号> --no-web --ai-index --ai-limit 2000
 
 # 查看已备份的群
 python -m qqalbum --groups
@@ -539,7 +539,16 @@ Funnel 的域名解析到 Tailscale 地址（`100.64.0.0/10` 里的 `100.x.y.z`�
 
 三种解法：
 
-1. **只影响本机浏览器**：用 `open_fixed_url.bat`（带 `--no-proxy-server` 打开）。
+1. **只影响本机浏览器**：用 `open_fixed_url.bat`，或桌面上的「群相册备份（固定地址）」
+   快捷方式。⚠️ 关键细节：**光加 `--no-proxy-server` 没用** —— Edge/Chrome 是单实例的，
+   如果浏览器已经在运行，新开的"窗口"只是复用已有进程，**这个参数会被直接丢掉**，
+   窗口仍然走 PAC（实测踩坑：本机有 23 个 msedge.exe 进程，加了参数照样打不开）。
+   必须再给一个独立的 `--user-data-dir`，强制它另起一个进程，参数才会生效：
+   ```bat
+   msedge --user-data-dir="%LOCALAPPDATA%\qqalbum-browser" --no-proxy-server ^
+          --new-window https://<你的地址>.ts.net
+   ```
+   （别用 `^` 续行接在 `start` 后面 —— 参数会被截断，这是另一个踩过的坑。）
 2. **给 PAC 加绕过**：让代理客户端对 `100.64.0.0/10` 或 `*.ts.net` 返回 `DIRECT`。
 3. **改 Windows 代理绕过**（PAC 与静态代理并存时有效）：
    `设置 → 网络和 Internet → 代理 → 手动设置代理 → 绕过列表` 里加 `100.*;*.ts.net`。
@@ -572,7 +581,7 @@ Funnel 的域名解析到 Tailscale 地址（`100.64.0.0/10` 里的 `100.x.y.z`�
 ## 10. 常见问题
 
 **Q：提示「浏览器尚未登录 QQ 空间」？**
-在自动打开的 Edge 窗口里扫码登录一次即可；登录态保存在 `D:\QQAlbumBackup\edge-profile`，
+在自动打开的 Edge 窗口里扫码登录一次即可；登录态保存在 `<备份目录>\edge-profile`，
 之后无需重复登录。若窗口已被关闭，重新运行程序会自动拉起。
 
 **Q：抓取动态时报「非该群成员，无法查看照片和进行操作」？**

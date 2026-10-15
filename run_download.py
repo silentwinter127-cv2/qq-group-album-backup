@@ -11,7 +11,7 @@ from qqalbum.qzone import QzoneClient  # noqa: E402
 from qqalbum.store import Store  # noqa: E402
 
 GROUP = "123456789"
-ROOT = r"D:\QQAlbumBackup"
+ROOT = r"<备份目录>"
 LIMIT = next((int(a) for a in sys.argv[1:] if a.isdigit()), 0)
 
 store = Store(os.path.join(ROOT, "qqalbum.sqlite3"))

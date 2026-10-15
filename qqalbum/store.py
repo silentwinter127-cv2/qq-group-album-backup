@@ -9,7 +9,20 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-DEFAULT_DB = r"D:\QQAlbumBackup\qqalbum.sqlite3"
+def default_root() -> str:
+    """Where backups live by default.
+
+    $QQALBUM_ROOT wins; otherwise a `backup` folder next to the checkout. Deliberately
+    not a fixed drive letter, so a fresh clone works anywhere.
+    """
+    env = os.environ.get("QQALBUM_ROOT")
+    if env:
+        return os.path.abspath(env)
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(here, "backup")
+
+
+DEFAULT_DB = os.path.join(default_root(), "qqalbum.sqlite3")
 
 SCHEMA_VERSION = 1
 
