@@ -1236,5 +1236,111 @@ class VideoUpsertKeepsDataTests(unittest.TestCase):
         self.assertEqual(row["duration_ms"], 9000)
 
 
+class TimeAxisTests(unittest.TestCase):
+    """时间轴：按日汇总 + 按月份跳页（跳页靠月份切片，不是 offset 翻页）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(os.path.join(self.tmp.name, "axis.sqlite3"))
+        base = {"_album_id": "A1", "owner": "7", "burl": "http://c/x/200"}
+        self.store.upsert_photos(G, [
+            {**base, "id": "a1", "uploadtime": 1789000000},
+            {**base, "id": "a2", "uploadtime": 1789000100},
+            {**base, "id": "a3", "uploadtime": 1788800000},
+            {**base, "id": "a4", "uploadtime": 1767000000},
+        ])
+
+    def tearDown(self):
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def test_time_axis_groups_by_day(self):
+        days = self.store.time_axis(G)
+        self.assertTrue(days)
+        self.assertEqual(sum(int(d["photos"]) for d in days), 4)
+        dates = [d["date"] for d in days]
+        self.assertEqual(dates, sorted(dates, reverse=True))
+        for day in days:
+            self.assertTrue(day["date"])
+            self.assertTrue(day["year"] and day["month"] and day["day"])
+
+    def test_time_axis_stored_counts(self):
+        self.store.set_photo_file(G, "a1", "done", path="/tmp/a1.jpg", size=100)
+        days = self.store.time_axis(G)
+        self.assertEqual(sum(int(d["stored"]) for d in days), 1)
+        only_local = self.store.time_axis(G, only_local=True)
+        self.assertEqual(sum(int(d["photos"]) for d in only_local), 1)
+
+    def test_photos_by_month_slices(self):
+        """按月份取的是"整个月"，不是一天 —— 跳页的粒度就是月。"""
+        day = self.store.time_axis(G)[0]
+        year, month = day["year"], day["month"]
+        # 这个月里共有几天、共几张
+        same_month = [d for d in self.store.time_axis(G)
+                      if d["year"] == year and d["month"] == month]
+        month_total = sum(int(d["photos"]) for d in same_month)
+        data = self.store.photos_by_month(G, year=year, month=month, per_page=1)
+        self.assertEqual(data["total"], month_total)
+        self.assertEqual(len(data["items"]), 1)
+        self.assertTrue(data["has_more"])
+        page2 = self.store.photos_by_month(G, year=year, month=month, page=2, per_page=1)
+        self.assertEqual(len(page2["items"]), 1)
+        self.assertNotEqual(page2["items"][0]["photo_id"], data["items"][0]["photo_id"])
+        # 每一页返回的日期都应落在这个月内
+        for item in data["items"] + page2["items"]:
+            self.assertTrue(str(item["upload_time"]).startswith(f"{year}-{month}"))
+
+    def test_photos_by_month_year_only(self):
+        year = self.store.time_axis(G)[0]["year"]
+        self.assertGreaterEqual(self.store.photos_by_month(G, year=year)["total"], 1)
+
+    def test_photos_by_month_all(self):
+        """不带年月时返回全部，且列名不因 join albums 而歧义（曾报 ambiguous column）。"""
+        data = self.store.photos_by_month(G, per_page=10)
+        self.assertEqual(data["total"], 4)
+        self.assertEqual(len(data["items"]), 4)
+        self.assertFalse(data["has_more"])
+
+    def test_photos_by_album_filter(self):
+        self.assertEqual(self.store.photos_by_month(G, album_id="A1")["total"], 4)
+        self.assertEqual(self.store.photos_by_month(G, album_id="nope")["total"], 0)
+
+    def test_api_wraps_axis_into_years(self):
+        """Api.time_axis 要把按日的结果聚成 年 → 月 供前端跳页。"""
+        api = Api.__new__(Api)
+        api.group_id = G
+        api.store = self.store
+        result = api.time_axis({})
+        self.assertEqual(result["total"], 4)
+        self.assertTrue(result["years"])
+        year = result["years"][0]
+        self.assertTrue(year["year"])
+        self.assertTrue(year["months"])
+        self.assertEqual(year["photos"], sum(m["photos"] for m in year["months"]))
+        self.assertEqual([y["year"] for y in result["years"]],
+                         sorted([y["year"] for y in result["years"]], reverse=True))
+
+    def test_decorate_photo_rows_marks_video_covers(self):
+        self.store.upsert_videos(G, [{"video_id": "v1", "album_id": "A1", "lloc": "a1!!"}])
+        self.store.upsert_photos(G, [
+            {**{"_album_id": "A1", "owner": "7", "burl": "http://c/y/200"},
+             "id": "a1", "lloc": "a1!!", "uploadtime": 1789000000},
+        ])
+        self.store.link_videos_to_photos(G)
+        api = Api.__new__(Api)
+        api.group_id = G
+        api.store = self.store
+        items = [dict(self.store.query_one(
+            "SELECT * FROM photos WHERE photo_id=?", ("a1",)))]
+        api._decorate_photo_rows(items)
+        self.assertIn("has_file", items[0])
+        self.assertIn("is_video_cover", items[0])
+        self.assertTrue(items[0]["is_video_cover"])
+        self.assertEqual(items[0]["video_id"], "v1")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -875,6 +875,73 @@ class Store:
             params.append(str(album_id))
         return [str(r["photo_id"]) for r in self.query(sql, params)]
 
+    # ------------------------------------------------------------ time axis
+    def time_axis(self, group_id: str, album_id: Optional[str] = None,
+                  only_local: bool = False) -> List[Dict[str, Any]]:
+        """按 日 汇总的照片数，给"时间轴"页做日期分组与年/月跳转用。
+
+        为什么按日预汇总而不是直接翻照片：时间轴要画「2026年09月09日」这样的分隔条，
+        还要能一键跳到某年某月。逐页翻照片再在浏览器里分组的话，跳转就没法精确。
+        45k 行按索引列 strftime 分组实测很快，一次算完给前端。
+        """
+        where = ["group_id=?", "upload_epoch IS NOT NULL"]
+        params: List[Any] = [str(group_id)]
+        if album_id:
+            where.append("album_id=?")
+            params.append(str(album_id))
+        if only_local:
+            where.append("file_status IN ('done','thumb-only')")
+        rows = self.query(
+            "SELECT strftime('%Y', upload_epoch, 'unixepoch', 'localtime') AS year, "
+            "       strftime('%m', upload_epoch, 'unixepoch', 'localtime') AS month, "
+            "       strftime('%d', upload_epoch, 'unixepoch', 'localtime') AS day, "
+            "       strftime('%Y-%m-%d', upload_epoch, 'unixepoch', 'localtime') AS date, "
+            "       COUNT(*) AS photos, "
+            "       SUM(CASE WHEN file_status IN ('done','thumb-only') THEN 1 ELSE 0 END) AS stored "
+            "FROM photos WHERE " + " AND ".join(where) +
+            " GROUP BY date ORDER BY date DESC", params)
+        return [dict(r) for r in rows]
+
+    def photos_by_month(self, group_id: str, year: str = "", month: str = "",
+                        album_id: Optional[str] = None, only_local: bool = False,
+                        page: int = 1, per_page: int = 120) -> Dict[str, Any]:
+        """取某年某月的照片（按上传时间倒序），供时间轴分页加载。
+
+        year/month 都留空时返回全部（首屏就是最新的那些）。跳页靠 year/month，
+        而不是 offset —— offset 翻到几万条会很慢，按月份切片永远只扫一个月。
+        """
+        where = ["p.group_id=?", "p.upload_epoch IS NOT NULL"]
+        params: List[Any] = [str(group_id)]
+        if album_id:
+            where.append("p.album_id=?")
+            params.append(str(album_id))
+        if only_local:
+            where.append("p.file_status IN ('done','thumb-only')")
+        if year and month:
+            where.append("strftime('%Y-%m', p.upload_epoch, 'unixepoch', 'localtime')=?")
+            params.append(f"{int(year):04d}-{int(month):02d}")
+        elif year:
+            where.append("strftime('%Y', p.upload_epoch, 'unixepoch', 'localtime')=?")
+            params.append(f"{int(year):04d}")
+        clause = " AND ".join(where)
+        # ⚠️ 列名要带 p. 前缀：join 了 albums，两个表都有 group_id/album_id，
+        #    不加前缀 SQLite 会报 ambiguous column name。
+        total = int(self.query_one(
+            f"SELECT COUNT(*) AS c FROM photos p WHERE {clause}", params)["c"])
+        per_page = max(1, min(400, int(per_page or 120)))
+        page = max(1, int(page or 1))
+        rows = self.query(
+            f"SELECT p.*, a.title AS album_title FROM photos p "
+            f"LEFT JOIN albums a ON a.group_id=p.group_id AND a.album_id=p.album_id "
+            f"WHERE {clause} ORDER BY p.upload_epoch DESC, p.photo_id LIMIT ? OFFSET ?",
+            [*params, per_page, (page - 1) * per_page])
+        items = []
+        for row in rows:
+            item = dict(row)
+            item.pop("raw_json", None)
+            items.append(item)
+        return {"total": total, "page": page, "per_page": per_page,
+                "has_more": page * per_page < total, "items": items}
 
     # ---------------------------------------------------------------- feeds
     def upsert_feed(self, group_id: str, feed: Dict[str, Any], server_offset: int = 0) -> None:

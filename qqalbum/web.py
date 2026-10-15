@@ -366,6 +366,61 @@ class Api:
             (self.group_id,))
         return [dict(r) for r in rows]
 
+    # ------------------------------------------------------------ time axis
+    def time_axis(self, params: Dict[str, List[str]]) -> Dict[str, Any]:
+        """时间轴索引：年 → 月 → 日 的照片数，供日期分组与跳页用。"""
+        def one(key: str, default: str = "") -> str:
+            values = params.get(key) or []
+            return values[0] if values else default
+
+        only_local = one("downloaded") == "1"
+        days = self.store.time_axis(self.group_id, album_id=one("album_id") or None,
+                                    only_local=only_local)
+        years: Dict[str, Dict[str, Any]] = {}
+        for row in days:
+            year = str(row.get("year") or "")
+            month = str(row.get("month") or "")
+            if not year or not month:
+                continue
+            entry = years.setdefault(year, {"year": year, "photos": 0, "months": {}})
+            entry["photos"] += int(row["photos"] or 0)
+            slot = entry["months"].setdefault(month, {"month": month, "photos": 0})
+            slot["photos"] += int(row["photos"] or 0)
+        out_years = []
+        for year in sorted(years, reverse=True):
+            entry = years[year]
+            entry["months"] = [entry["months"][m] for m in sorted(entry["months"])]
+            out_years.append(entry)
+        return {"total": sum(int(d["photos"] or 0) for d in days),
+                "days": days, "years": out_years}
+
+    def photos_by_month(self, params: Dict[str, List[str]]) -> Dict[str, Any]:
+        def one(key: str, default: str = "") -> str:
+            values = params.get(key) or []
+            return values[0] if values else default
+
+        data = self.store.photos_by_month(
+            self.group_id,
+            year=one("year"), month=one("month"),
+            album_id=one("album_id") or None,
+            only_local=one("downloaded") == "1",
+            page=int(one("page", "1") or 1),
+            per_page=int(one("per_page", "120") or 120))
+        self._decorate_photo_rows(data["items"])
+        return data
+
+    def _decorate_photo_rows(self, items: List[Dict[str, Any]]) -> None:
+        """给时间轴的照片补上 UI 要用的字段（有没有本地文件、是不是视频封面）。"""
+        if not items:
+            return
+        mapping = self.store.video_ids_for_photos(self.group_id, [i["photo_id"] for i in items])
+        for item in items:
+            item["has_file"] = bool(item.get("file_path")) and item.get("file_status") in (
+                "done", "thumb-only")
+            item["is_video_cover"] = item["photo_id"] in mapping
+            if item["is_video_cover"]:
+                item["video_id"] = mapping[item["photo_id"]]
+
     def top_uploaders(self, limit: int = 20) -> List[Dict[str, Any]]:
         rows = self.store.query(
             "SELECT uploader_uin AS uin, MAX(uploader_nick) AS nick, COUNT(*) AS photos, "
@@ -792,6 +847,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"items": api.tags()})
         if path == "/api/timeline":
             return self._json({"items": api.timeline()})
+        if path == "/api/time-axis":
+            return self._json(api.time_axis(params))
+        if path == "/api/time-photos":
+            return self._json(api.photos_by_month(params))
         if path == "/api/top_uploaders":
             return self._json({"items": api.top_uploaders()})
         if path == "/api/comments":

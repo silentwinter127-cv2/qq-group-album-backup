@@ -132,6 +132,233 @@ function render() {
   else if (state.view === 'comments') renderComments(view);
   else if (state.view === 'gallery') renderGallery(view);
   else if (state.view === 'timeline') renderTimeline(view);
+  else if (state.view === 'axis') renderAxis(view);
+}
+
+/* --------------------------------------------------------------- 时间轴 */
+// 按「年月日」分组浏览全部照片，右侧给年/月索引可一键跳页（照手机 QQ 相册那个样子）。
+// 跳页按**月份切片**，不是 offset 翻页 —— offset 翻到几万条会越来越慢，
+// 按月份切片永远只扫一个月（实测 3 千多张的月份 0.3 秒）。
+const axisState = {
+  index: null,       // /api/time-axis 的结果
+  filter: { year: '', month: '', album_id: '' },
+  page: 1,
+  perPage: 120,
+  photos: [],
+  hasMore: false,
+  loading: false,
+  observer: null,
+};
+
+async function renderAxis(root) {
+  if (axisState.observer) {
+    axisState.observer.disconnect();
+    axisState.observer = null;
+  }
+
+  const head = el('div', 'view-head');
+  head.appendChild(el('h2', '', '时间轴'));
+  const toolbar = el('div', 'ai-row');
+
+  const albumSel = el('select', 'select');
+  albumSel.appendChild(new Option('全部相册', ''));
+  ((state.overview && state.overview.albums) || []).forEach((a) =>
+    albumSel.appendChild(new Option(`${a.title} (${a.stored})`, a.album_id)));
+  albumSel.value = axisState.filter.album_id || '';
+  albumSel.onchange = () => {
+    axisState.filter.album_id = albumSel.value;
+    axisState.page = 1;
+    renderAxis(root);
+  };
+  toolbar.appendChild(albumSel);
+
+  toolbar.appendChild(el('span', 'ai-hint',
+    axisState.filter.year
+      ? `当前：${axisState.filter.year} 年${axisState.filter.month ? ` ${Number(axisState.filter.month)} 月` : ''}`
+      : '当前：全部时间'));
+  if (axisState.filter.year) {
+    const back = el('button', 'btn tiny', '回到全部');
+    back.onclick = () => {
+      axisState.filter.year = '';
+      axisState.filter.month = '';
+      axisState.page = 1;
+      renderAxis(root);
+    };
+    toolbar.appendChild(back);
+  }
+  head.appendChild(toolbar);
+  root.appendChild(head);
+
+  const layout = el('div', 'axis-layout');
+  const stream = el('div', 'axis-stream');
+  const aside = el('div', 'axis-index');
+  layout.appendChild(stream);
+  layout.appendChild(aside);
+  root.appendChild(layout);
+  stream.appendChild(el('div', 'empty', '加载中…'));
+
+  try {
+    const params = new URLSearchParams();
+    if (axisState.filter.album_id) params.set('album_id', axisState.filter.album_id);
+    axisState.index = await api('/api/time-axis?' + params.toString());
+  } catch (e) {
+    const fresh = root.querySelector('.axis-stream');
+    if (fresh) {
+      fresh.innerHTML = '';
+      fresh.appendChild(el('div', 'empty', '读取时间轴失败：' + esc(e.message)));
+    }
+    return;
+  }
+  if (!root.isConnected) return;
+  const freshAside = root.querySelector('.axis-index');
+  renderAxisIndex(freshAside || aside, root);
+
+  axisState.page = 1;
+  axisState.photos = [];
+  await loadAxisPhotos(root, root.querySelector('.axis-stream') || stream, freshAside || aside);
+}
+
+function renderAxisIndex(aside, root) {
+  aside.innerHTML = '';
+  const title = el('div', 'axis-index-title');
+  title.innerHTML = '<span>🕘</span> 时间';
+  aside.appendChild(title);
+  const index = axisState.index || { years: [] };
+  if (!index.years.length) {
+    aside.appendChild(el('div', 'ai-hint', '没有带时间的照片'));
+    return;
+  }
+  index.years.forEach((year) => {
+    const group = el('div', 'axis-year');
+    const head = el('div', 'axis-year-head');
+    head.innerHTML = `<span class="axis-dot"></span>${esc(year.year)}年`;
+    head.classList.toggle('on',
+      axisState.filter.year === year.year && !axisState.filter.month);
+    head.onclick = () => jumpAxis(root, year.year, '');
+    group.appendChild(head);
+
+    const months = el('div', 'axis-months');
+    year.months.forEach((m) => {
+      const item = el('div', 'axis-month');
+      item.innerHTML = `${Number(m.month)}月<span class="n">${fmtNum(m.photos)}</span>`;
+      item.classList.toggle('on',
+        axisState.filter.year === year.year && axisState.filter.month === m.month);
+      item.onclick = () => jumpAxis(root, year.year, m.month);
+      months.appendChild(item);
+    });
+    group.appendChild(months);
+    aside.appendChild(group);
+  });
+}
+
+function jumpAxis(root, year, month) {
+  axisState.filter.year = year;
+  axisState.filter.month = month || '';
+  axisState.page = 1;
+  axisState.photos = [];
+  renderAxis(root);
+}
+
+async function loadAxisPhotos(root, stream, aside) {
+  if (axisState.loading) return;
+  axisState.loading = true;
+  const params = new URLSearchParams({
+    page: String(axisState.page), per_page: String(axisState.perPage),
+  });
+  if (axisState.filter.year) params.set('year', axisState.filter.year);
+  if (axisState.filter.month) params.set('month', axisState.filter.month);
+  if (axisState.filter.album_id) params.set('album_id', axisState.filter.album_id);
+
+  let data;
+  try {
+    data = await api('/api/time-photos?' + params.toString());
+  } catch (e) {
+    axisState.loading = false;
+    const fresh = root.querySelector('.axis-stream');
+    if (fresh) fresh.appendChild(el('div', 'empty', '加载失败：' + esc(e.message)));
+    return;
+  }
+  axisState.loading = false;
+  if (!root.isConnected) return;
+
+  const freshStream = root.querySelector('.axis-stream');
+  if (freshStream) stream = freshStream;
+  if (axisState.page === 1) stream.innerHTML = '';
+  if (axisState.page === 1 && !data.items.length) {
+    stream.appendChild(el('div', 'empty', '这个时间段里没有照片'));
+    return;
+  }
+
+  // 按日期分组渲染：每组的标题就是「2026年09月09日」
+  const grouped = new Map();
+  data.items.forEach((photo) => {
+    const date = String(photo.upload_time || '').slice(0, 10) || '未知日期';
+    if (!grouped.has(date)) grouped.set(date, []);
+    grouped.get(date).push(photo);
+  });
+
+  grouped.forEach((photos, date) => {
+    const section = el('section', 'axis-day');
+    section.id = 'axis-day-' + date;
+    const dayHead = el('div', 'axis-day-head');
+    dayHead.innerHTML = `<span class="axis-day-date">${esc(formatAxisDate(date))}</span>`
+      + `<span class="n">${fmtNum(photos.length)} 张</span>`;
+    section.appendChild(dayHead);
+
+    const grid = el('div', 'axis-grid');
+    photos.forEach((photo) => {
+      const card = el('div', 'axis-cell');
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.src = `/api/thumb?photo_id=${encodeURIComponent(photo.photo_id)}&size=320`;
+      img.onerror = () => {
+        img.onerror = null;
+        img.src = `/api/image?photo_id=${encodeURIComponent(photo.photo_id)}`;
+      };
+      card.appendChild(img);
+      if (!photo.has_file) card.appendChild(el('div', 'axis-badge', '仅元数据'));
+      if (photo.is_video_cover) card.appendChild(el('div', 'axis-badge video', '视频'));
+      card.title = `${photo.uploader_nick || ''} · ${String(photo.upload_time || '').slice(0, 16)}`;
+      card.onclick = () => openDetail(photo.photo_id,
+        axisState.photos.map((p) => p.photo_id), axisState.photos.indexOf(photo));
+      grid.appendChild(card);
+    });
+    section.appendChild(grid);
+    stream.appendChild(section);
+  });
+
+  axisState.photos = axisState.photos.concat(data.items);
+  axisState.hasMore = Boolean(data.has_more);
+
+  const existing = stream.querySelector('.axis-more');
+  if (existing) existing.remove();
+  if (axisState.hasMore) {
+    const more = el('div', 'axis-more');
+    more.appendChild(el('div', 'ai-hint',
+      `已加载 ${fmtNum(axisState.photos.length)} / ${fmtNum(data.total)} 张，继续往下滚…`));
+    stream.appendChild(more);
+    // 滚到底自动加载下一页。
+    // ⚠️ root 必须传滚动的那个元素：真正滚的是 #view（.view 有 overflow-y:auto），
+    //    不是窗口 —— 用默认的视口当 root 的话，哨兵元素"进入视口"的判断永远不成立，
+    //    表现就是「滚到底什么都不发生」。
+    if (axisState.observer) axisState.observer.disconnect();
+    axisState.observer = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting) && axisState.hasMore && !axisState.loading) {
+        axisState.page += 1;
+        loadAxisPhotos(root, stream, aside);
+      }
+    }, { root: root, rootMargin: '600px' });
+    axisState.observer.observe(more);
+  } else if (axisState.photos.length) {
+    stream.appendChild(el('div', 'ai-hint axis-end',
+      `—— 共 ${fmtNum(axisState.photos.length)} 张，到底了 ——`));
+  }
+}
+
+function formatAxisDate(date) {
+  const parts = String(date || '').split('-');
+  if (parts.length !== 3) return date || '未知日期';
+  return `${parts[0]}年${parts[1]}月${parts[2]}日`;
 }
 
 /* --------------------------------------------------------------- 视频 */
