@@ -9,7 +9,7 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 ROOT = r"C:\path\to\qq-group-album-backup"
-FILES = ["share_online.bat", "run_backup.bat", "start_album.bat",
+FILES = ["share_online.bat", "fixed_online.bat", "run_backup.bat", "start_album.bat",
          "autostart_album.bat", "stop_album.bat"]
 
 for name in FILES:

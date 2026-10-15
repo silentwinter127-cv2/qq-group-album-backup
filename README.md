@@ -467,6 +467,44 @@ share_online.bat <群号> 你的口令
 未登录时：`/api/*` 返回 `401 {"auth_required":true}`，首页返回登录页，
 **静态资源也一起挡住**（`/static/app.js` 也是 401，避免靠猜路径绕过）。
 
+### 固定地址（不用每次换网址）
+
+Cloudflare 快速隧道（`share_online.bat`）的网址**每次启动都会变**，而且官方声明这种
+无账号隧道**没有可用性保证**。实测重启一次：
+
+```
+旧 https://nashville-...-ideal.trycloudflare.com   → HTTP 530
+新 https://significantly-...-justin.trycloudflare.com → 200
+```
+
+要固定地址有三条路：
+
+| 方案 | 固定地址 | 对方要装东西吗 | 你这边要装吗 | 花钱 |
+| --- | --- | --- | --- | --- |
+| 临时隧道 `share_online.bat` | ✗ 每次都变 | 不用 | 不用 | 免费 |
+| **Tailscale Funnel** `fixed_online.bat` | ✓ `https://<机器名>.<tailnet>.ts.net` | **不用** | 装一次 Tailscale | **免费** |
+| Cloudflare 命名隧道 | ✓ `album.你的域名.com` | 不用 | 不用 | 要买域名 |
+
+**想要「固定地址 + 对方什么都不用装 + 不花钱」，答案就是 Tailscale Funnel。**
+它包含在免费 Personal 计划里，只转发 443 / 8443 / 10000，前面挂 HTTPS。
+
+```bat
+fixed_online.bat <群号> 你的口令
+```
+
+首次运行会：下载安装 Tailscale（弹 UAC 点「是」）→ 打开浏览器让你授权一次 →
+开启 Funnel → 打印固定地址并记到 `tools\fixed_url.txt`。之后重启电脑也不变。
+
+常见报错对照：
+
+* `HTTPS is disabled` → 去 <https://login.tailscale.com/admin/dns> 勾选 HTTPS Certificates
+* `funnel not available for this node` → 去 <https://login.tailscale.com/admin/acls>
+  确认没禁用 funnel 节点属性
+* 地址能打开但 502 → 本机相册服务没在跑，先 `start_album.bat`
+* 想停掉对外访问 → `tailscale funnel 443 off`
+
+口令必须保留：Funnel 是**公开地址**，任何人拿到网址都会到登录页。
+
 ### 两种对外方式怎么选
 
 * **Tailscale（更安全，推荐长期用）**：装完相当于把你的电脑和对方设备放进同一个
