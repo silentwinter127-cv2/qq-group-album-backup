@@ -99,7 +99,7 @@ def main() -> int:
         print("   需要登录，正在打开浏览器授权页…")
         print("   ⚠️ 请在浏览器里用 Google/GitHub/微软账号登录并授权，然后回来继续。")
         subprocess.Popen([exe, "up"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for i in range(60):
+        for i in range(24):
             time.sleep(5)
             code, out = run([exe, "status"], timeout=60)
             if code == 0 and "Logged out" not in out:
@@ -108,7 +108,9 @@ def main() -> int:
             if i % 6 == 5:
                 print(f"   …仍在等待登录（{(i + 1) * 5} 秒）")
         else:
-            print("   一直没登录成功。请手动跑：tailscale up")
+            print("   还没登录。这不影响什么 —— 等你授权完成后重新运行本脚本就行：")
+            print("     tailscale up")
+            print("     fixed_online.bat <群号> <口令>")
             return 1
     else:
         print("   已登录：")
@@ -116,11 +118,21 @@ def main() -> int:
         print("     ", line)
 
     step("4/5 打开 Funnel 并指向本机相册服务")
-    code, out = run([exe, "funnel", "443", "on"], timeout=120)
-    print("   funnel on :", out[:200] or f"exit {code}")
-    code, out = run([exe, "serve", "--bg", "--https=443",
-                     f"http://127.0.0.1:{port}"], timeout=120)
-    print("   serve     :", out[:200] or f"exit {code}")
+    # ⚠️ 新版 tailscale 的 serve/funnel CLI 变了：
+    #    旧写法 `tailscale funnel 443 on` 会报
+    #    "the CLI for serve and funnel has changed"。
+    #    现在的写法是把目标直接交给 funnel，它同时负责 HTTPS 终止与转发
+    #    （不需要再单独跑 tailscale serve）。
+    code, out = run([exe, "funnel", "--bg", "--https=443",
+                     f"http://127.0.0.1:{port}"], timeout=180)
+    print("   funnel --bg :", (out[:300] or f"exit {code}"))
+    if code != 0 or "not enabled" in out.lower():
+        print("\n   ⚠️ 需要先在后台启用一次 Funnel —— Tailscale 强制要求本人同意：")
+        m2 = re.search(r"https://login\.tailscale\.com/\S+", out or "")
+        if m2:
+            print(f"      {m2.group(0)}")
+        print("      点开启用后，重新运行本脚本即可。")
+        return 1
 
     step("5/5 你的固定地址")
     code, out = run([exe, "funnel", "status"], timeout=60)
@@ -131,17 +143,21 @@ def main() -> int:
         url = m.group(0)
         print(f"\n   ✅ 固定地址： {url}")
         print("      这个地址重启电脑、重启服务都不会变，可以直接发给别人。")
-        print("      （对方打开会看到口令登录页，口令仍是你设的那个。）")
+        print("      （对方打开会看到口令登录页，口令在 album_password.txt。）")
     else:
         print("\n   没解析出 .ts.net 地址，请把上面的 status 输出发我。")
 
     step("常见报错对照")
-    print("   · 'Funnel is not enabled' / 'HTTPS is disabled'")
+    print("   · 'Funnel is not enabled on your tailnet'")
+    print("     → 打开它给出的 https://login.tailscale.com/f/funnel?node=... 点启用")
+    print("   · 'HTTPS is disabled'")
     print("     → 去 https://login.tailscale.com/admin/dns 勾选 HTTPS Certificates，再重跑")
     print("   · 'funnel not available for this node'")
     print("     → 去 https://login.tailscale.com/admin/acls 确认没禁用 funnel 节点属性")
-    print("   · 地址打开了但提示 502")
-    print("     → 本机相册服务没在跑；先 start_album.bat 起来再试")
+    print("   · 地址能打开但 502")
+    print("     → 本机相册服务没在跑，先 start_album.bat <群号> 起来")
+    print("   · 想停止对外访问")
+    print("     → tailscale funnel --https=443 off")
     if url:
         with open(os.path.join(ROOT, "tools", "fixed_url.txt"), "w",
                   encoding="utf-8") as fh:

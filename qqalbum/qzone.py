@@ -7,14 +7,13 @@ import time
 import urllib.parse
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from .cdp import (Browser, CDPError, DEFAULT_PROFILE_DIR, PageSession,
-                  is_timeout_error)
+from .cdp import Browser, CDPError, PageSession, is_timeout_error
 from .js_bridge import batch_id_of, flatten_feed, js_bridge, js_call, parse_attach_info
 
 H5_BASE = "https://h5.qzone.qq.com"
 INDEX_URL = H5_BASE + "/groupphoto/index?inqq=3&groupId={gid}"
 LOGIN_URL = "https://i.qq.com/"
-DEFAULT_PROFILE = DEFAULT_PROFILE_DIR
+DEFAULT_PROFILE = r"D:\QQAlbumBackup\edge-profile"
 
 
 class QzoneError(RuntimeError):
