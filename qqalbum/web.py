@@ -1014,7 +1014,10 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/api/health", "/api/ping"):
             # 轻量健康检查：给启动脚本、自启任务和外部工具（QQ 机器人技能）用来判断
             # 「服务到底起没起、是不是这个端口」，不碰数据库、不加载模型。
+            # auth_required 也报出来：share_online.bat 靠它确认端口上跑的是
+            # **带口令的**实例，避免把公网隧道指向一个没口令的旧实例。
             return self._json({"ok": True, "service": "qqalbum", "group_id": api.group_id,
+                               "auth_required": api.auth is not None,
                                "version": Handler.server_version})
         if path == "/api/overview":
             return self._json(api.overview())

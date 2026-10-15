@@ -66,6 +66,19 @@
     err.style.display = 'block';
   }
 
+  // 已经有有效会话就直接回主界面。
+  // 少了这一步会有一个很难查的现象：会话过期后主界面被踢到这里，
+  // 用户重新登录并回到 /，主界面却又自己跳回登录页 —— 因为它在未登录时
+  // 就已经开始发请求了。有了这个自检，登录后会稳定停在主界面。
+  (async () => {
+    try {
+      const res = await fetch('/api/auth-state', { cache: 'no-store' });
+      if (!res.ok) return;
+      const state = await res.json();
+      if (state.authed) location.replace('/');
+    } catch (e) { /* 服务不可用时忽略，留在登录页 */ }
+  })();
+
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     err.style.display = 'none';
