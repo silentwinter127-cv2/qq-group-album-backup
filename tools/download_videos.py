@@ -6,16 +6,15 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, r"C:\path\to\qq-group-album-backup")
 
 from qqalbum.crawler import BackupManager  # noqa: E402
-from qqalbum.store import Store  # noqa: E402
+from qqalbum.store import DEFAULT_DB, Store, default_root  # noqa: E402
 
-import os as _os
-GROUP = _os.environ.get("QQALBUM_GROUP", "<群号>")
+GROUP = "123456789"
 LIMIT = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
-store = Store(r"<备份目录>\qqalbum.sqlite3")
+store = Store(DEFAULT_DB)
 print("待下载视频:", len(store.videos_missing_files(GROUP, limit=LIMIT)))
 
-manager = BackupManager(GROUP, store, root_dir=r"<备份目录>",
+manager = BackupManager(GROUP, store, root_dir=default_root(),
                         client_factory=lambda: None)
 state = manager.state
 manager.start_video_download(limit=LIMIT)

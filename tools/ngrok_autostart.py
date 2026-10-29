@@ -24,7 +24,21 @@ import sys
 import time
 import urllib.request
 
-sys.stdout.reconfigure(encoding="utf-8")
+# pythonw.exe 下没有控制台：sys.stdout/sys.stderr 是 None。
+# 必须在任何 reconfigure/print 之前兜底，否则 None.reconfigure 直接 AttributeError。
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+# 让子进程不弹控制台窗口（见 tools/_win.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _win import popen_hidden, run_hidden  # noqa: E402
+
+if sys.stdout is not None:
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
 ROOT = r"C:\path\to\qq-group-album-backup"
 NGROK = os.path.join(ROOT, "tools", "bin", "ngrok.exe")
 CFG = os.path.join(ROOT, "tools", "ngrok-config", "ngrok.yml")
@@ -43,7 +57,7 @@ def log(msg: str) -> None:
 
 
 def running() -> bool:
-    out = subprocess.run(
+    out = run_hidden(
         ["powershell", "-NoProfile", "-Command",
          "(Get-Process ngrok -ErrorAction SilentlyContinue | Measure-Object).Count"],
         capture_output=True, text=True, timeout=60)
@@ -80,7 +94,7 @@ foreach ($d in @('{DESKTOPS[0]}', '{DESKTOPS[1]}')) {{
   }}
 }}
 """
-    subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+    run_hidden(["powershell", "-NoProfile", "-Command", ps],
                    capture_output=True, timeout=120)
 
 
@@ -95,7 +109,7 @@ def main() -> int:
     else:
         if running():
             log("已有 ngrok 但地址不通，重启它")
-            subprocess.run(["powershell", "-NoProfile", "-Command",
+            run_hidden(["powershell", "-NoProfile", "-Command",
                             "Get-Process ngrok -ErrorAction SilentlyContinue | "
                             "Stop-Process -Force -ErrorAction SilentlyContinue"],
                            capture_output=True, timeout=60)
@@ -106,7 +120,7 @@ def main() -> int:
             pass
         log("启动 ngrok …")
         with open(LOG, "wb") as out:
-            subprocess.Popen(
+            popen_hidden(
                 [NGROK, "http", str(PORT), "--config", CFG,
                  "--log", "stdout", "--log-format", "json"],
                 stdout=out, stderr=out,

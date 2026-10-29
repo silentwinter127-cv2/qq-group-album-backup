@@ -1421,5 +1421,363 @@ class AuthTests(unittest.TestCase):
         self.assertIn("Secure", https)
 
 
+class LoginRefreshTests(unittest.TestCase):
+    """扫码登录必须能被后续抓取看见（回归：缓存 session_info 导致永远「尚未登录」）。"""
+
+    class FakePage:
+        def __init__(self, url="https://i.qq.com/"):
+            self._url = url
+            self.navigated = []
+            self.evals = 0
+
+        def url(self):
+            return self._url
+
+        def navigate(self, url, wait=0.0):
+            self.navigated.append(url)
+            self._url = url
+
+        def wait_ready(self, timeout=0):
+            return True
+
+        def eval(self, expr, timeout=0):
+            self.evals += 1
+            return True
+
+    def _client(self, page, probes):
+        from qqalbum.qzone import QzoneClient
+
+        client = QzoneClient("1", profile_dir=str(tempfile.gettempdir()))
+        client._page = page
+        it = iter(probes)
+        client._probe_session = lambda: next(it, dict(probes[-1]))
+        return client
+
+    def test_waits_for_scan_then_reports_logged_in(self):
+        page = self.FakePage()
+        probes = [{"uin": "", "logged_in": False, "url": "https://i.qq.com/"},
+                  {"uin": "", "logged_in": False, "url": "https://i.qq.com/"},
+                  {"uin": "42", "logged_in": True, "url": "https://h5.qzone.qq.com/groupphoto/index"}]
+        client = self._client(page, probes)
+        info = client.refresh_session(wait_login=5, poll=0)
+        self.assertTrue(info["logged_in"])
+        self.assertEqual(info["uin"], "42")
+        # 登录页上正显示二维码，绝不能导航走
+        self.assertEqual(page.navigated, [])
+
+    def test_cancel_stops_waiting_quickly(self):
+        page = self.FakePage()
+        client = self._client(page, [{"uin": "", "logged_in": False, "url": "https://i.qq.com/"}])
+        info = client.refresh_session(wait_login=600, poll=0, should_cancel=lambda: True)
+        self.assertFalse(info["logged_in"])
+
+    def test_blank_page_navigates_to_album(self):
+        page = self.FakePage("about:blank")
+        client = self._client(page, [{"uin": "7", "logged_in": True,
+                                      "url": "https://h5.qzone.qq.com/groupphoto/index"}])
+        info = client.refresh_session(wait_login=0)
+        self.assertTrue(info["logged_in"])
+        self.assertEqual(page.navigated, [client.index_url])
+
+    def test_manager_refreshes_session_while_browser_stays_up(self):
+        """浏览器没崩、用户中途扫码 —— ensure_connected 必须重新探测。"""
+        from qqalbum.crawler import BackupManager
+
+        class FakeBrowser:
+            def is_up(self):
+                return True
+
+        class StaleClient:
+            def __init__(self):
+                self.browser = FakeBrowser()
+                self.session_info = {"uin": "", "logged_in": False}
+                self.refresh_calls = 0
+
+            def refresh_session(self, wait_login=0.0, poll=2.0, should_cancel=None):
+                self.refresh_calls += 1
+                self.session_info = {"uin": "42", "logged_in": True}
+                return self.session_info
+
+            def connect(self):
+                return self.session_info
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = Store(os.path.join(tmp.name, "p.sqlite3"))
+        self.addCleanup(store.close)
+        manager = BackupManager("1", store, lambda: StaleClient(), tmp.name)
+        stale = StaleClient()
+        manager._client = stale
+
+        got = manager.ensure_connected()
+        self.assertIs(got, stale)
+        self.assertEqual(stale.refresh_calls, 1)
+        self.assertTrue(got.session_info["logged_in"])
+
+    def test_manager_rebuilds_when_refresh_fails(self):
+        from qqalbum.crawler import BackupManager
+
+        class FakeBrowser:
+            def is_up(self):
+                return True
+
+        class BrokenClient:
+            def __init__(self):
+                self.browser = FakeBrowser()
+                self.session_info = {"uin": "", "logged_in": False}
+
+            def refresh_session(self, **_k):
+                raise RuntimeError("页面会话已失效")
+
+        class FreshClient(BrokenClient):
+            def refresh_session(self, **_k):
+                self.session_info = {"uin": "9", "logged_in": True}
+                return self.session_info
+
+            def connect(self):
+                self.session_info = {"uin": "9", "logged_in": True}
+                return self.session_info
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = Store(os.path.join(tmp.name, "p.sqlite3"))
+        self.addCleanup(store.close)
+        manager = BackupManager("1", store, lambda: FreshClient(), tmp.name)
+        manager._client = BrokenClient()
+
+        got = manager.ensure_connected()
+        self.assertTrue(got.session_info["logged_in"])
+        self.assertIn("刷新登录状态失败", " ".join(manager.state.log))
+
+
+class CdpConcurrencyTests(unittest.TestCase):
+    """一条 WebSocket 上并发发请求会互相吞掉响应（表现为卡死，CPU 静止）。"""
+
+    def _browser(self, ws):
+        from qqalbum.cdp import Browser
+
+        browser = Browser(port=9222, profile_dir="", browser_path=__file__)
+        browser._connect_browser = lambda: ws  # type: ignore[assignment]
+        return browser
+
+    def test_parallel_calls_each_get_their_own_response(self):
+        import threading as _threading
+
+        class FakeSock:
+            def settimeout(self, _t):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeWS:
+            """Replies in FIFO order; records how many requests overlap."""
+
+            def __init__(self):
+                self.sock = FakeSock()
+                self.pending = []
+                self.guard = _threading.Lock()
+                self.inflight = 0
+                self.max_inflight = 0
+
+            def send(self, payload):
+                with self.guard:
+                    self.inflight += 1
+                    self.max_inflight = max(self.max_inflight, self.inflight)
+                    self.pending.append({"id": payload["id"],
+                                         "result": {"echo": payload["id"]}})
+
+            def recv(self):
+                time.sleep(0.05)
+                with self.guard:
+                    self.inflight -= 1
+                    return self.pending.pop(0)
+
+        ws = FakeWS()
+        browser = self._browser(ws)
+        results, errors = {}, []
+
+        def worker(name):
+            try:
+                results[name] = browser.call("Runtime.evaluate", {"expression": name},
+                                             timeout=5.0)
+            except Exception as exc:  # noqa: BLE001
+                errors.append((name, repr(exc)))
+
+        threads = [_threading.Thread(target=worker, args=(f"t{i}",)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+
+        self.assertEqual(errors, [], "并发调用不应超时/报错")
+        self.assertEqual(len(results), 4)
+        # 每个调用都拿到属于自己的 result
+        for name, result in results.items():
+            self.assertIn("echo", result, f"{name} 拿到了别人的响应：{result}")
+        # 关键断言：请求彼此不能重叠
+        self.assertEqual(ws.max_inflight, 1,
+                         f"CDP 请求发生了重叠（max_inflight={ws.max_inflight}），响应会被吞掉")
+
+
+class DeadSessionTests(unittest.TestCase):
+    """失效的 sessionId 不会回包，必须换新会话而不是拿死 id 反复等超时。"""
+
+    def test_page_session_reattaches_after_timeout(self):
+        from qqalbum.cdp import CDPError, PageSession
+
+        calls = []
+
+        class FakeBrowser:
+            def __init__(self):
+                self.attach_calls = 0
+
+            def attach(self, target_id):
+                self.attach_calls += 1
+                return f"S{self.attach_calls + 1}"
+
+            def call(self, method, params=None, session_id=None, timeout=30.0):
+                calls.append(session_id)
+                if session_id == "S1":
+                    raise CDPError("timeout waiting for Runtime.evaluate")
+                return {"result": {"value": "ok"}}
+
+        browser = FakeBrowser()
+        page = PageSession(browser, "S1", target_id="T1")
+        self.assertEqual(page.call("Runtime.evaluate", {}), {"result": {"value": "ok"}})
+        self.assertEqual(browser.attach_calls, 1, "超时后应重新 attach 一次")
+        self.assertEqual(page.session_id, "S2")
+        self.assertEqual(calls, ["S1", "S2"])
+
+    def test_non_session_error_is_not_retried(self):
+        from qqalbum.cdp import CDPError, PageSession
+
+        class FakeBrowser:
+            def attach(self, target_id):
+                raise AssertionError("不应该重新 attach")
+
+            def call(self, method, params=None, session_id=None, timeout=30.0):
+                raise CDPError("JavaScript error: undefined is not a function")
+
+        page = PageSession(FakeBrowser(), "S1", target_id="T1")
+        with self.assertRaises(CDPError):
+            page.call("Runtime.evaluate", {})
+
+    def test_feed_chunk_per_page_budget_fits_inside_eval_timeout(self):
+        from qqalbum.qzone import EVAL_TIMEOUT_S, feed_page_timeout_ms
+
+        for pages in (1, 5, 20, 50):
+            per_page = feed_page_timeout_ms(pages)
+            self.assertGreaterEqual(per_page, 2000)
+            self.assertLessEqual(per_page, 15000)
+            total_ms = per_page * pages
+            self.assertLess(
+                total_ms, EVAL_TIMEOUT_S * 1000,
+                f"{pages} 页 × {per_page}ms = {total_ms}ms 超过了 eval 超时"
+                f" {EVAL_TIMEOUT_S}s，页面内的 Promise.race 会失效",
+            )
+
+    def test_feed_chunk_uses_the_helper(self):
+        from qqalbum import qzone
+
+        captured = {}
+
+        class FakePage:
+            def eval(self, expr, timeout=60.0):
+                captured["expr"] = expr
+                captured["timeout"] = timeout
+                return '{"feeds":[],"attach":"","stalled":true}'
+
+        client = object.__new__(qzone.QzoneClient)
+        client._page = FakePage()
+        client.log = lambda *_a, **_k: None
+        client._feed_chunk("offset=1&total=9&basetime=1", 1, 10, 20)
+
+        self.assertEqual(captured["timeout"], qzone.EVAL_TIMEOUT_S)
+        self.assertIn(str(qzone.feed_page_timeout_ms(20)), captured["expr"],
+                      "JS 里的单页超时必须来自 feed_page_timeout_ms()")
+
+
+    def test_session_from_a_dropped_connection_fails_fast(self):
+        """重连之后旧 sessionId 永远拿不到回包，必须立刻报错而不是等满超时。"""
+        from qqalbum.cdp import Browser, CDPSessionLost
+
+        browser = Browser(port=9222, profile_dir="", browser_path=__file__)
+        browser._ws_generation = 1
+        browser._session_gen["S1"] = 1
+
+        # 同一个连接上的会话正常放行（这里只验证代际检查不误伤）
+        browser._session_gen["S1"] = browser._ws_generation = 2
+
+        browser._ws_generation = 3          # 模拟 socket 被重建
+        started = time.time()
+        with self.assertRaises(CDPSessionLost):
+            browser.call("Runtime.evaluate", {"expression": "1"},
+                         session_id="S1", timeout=30.0)
+        self.assertLess(time.time() - started, 1.0,
+                        "作废的会话必须立刻失败，不能等超时")
+
+
+class FeedCursorTests(unittest.TestCase):
+    """游标推不动时不能无限重取同一页（曾表现为「卡在 37/5391」）。"""
+
+    def _client(self, page, limit=50):
+        from qqalbum.qzone import QzoneClient
+
+        client = object.__new__(QzoneClient)
+        client.log = lambda *_a, **_k: None
+        client.new_feeds_since_chunk = 0
+        client.last_feed_attach = ""
+        client.last_feed_attach_before = ""
+        calls = {"n": 0}
+
+        def _feed_chunk(attach, feed_type, page_size, pages):
+            calls["n"] += 1
+            if calls["n"] > limit:
+                raise AssertionError("游标不前进时仍在无限重取同一页")
+            return dict(page)
+
+        client._feed_chunk = _feed_chunk  # type: ignore[assignment]
+        return client, calls
+
+    def test_stops_when_server_repeats_the_same_page(self):
+        page = {"feeds": [{"_batch_id": f"b{i}"} for i in range(7)],
+                "attach": "offset=5385&total=5391&basetime=1"}
+        client, calls = self._client(page)
+        items = list(client.iter_feeds(page_size=10, chunk_pages=20))
+        self.assertEqual(len(items), 7, "重复页里的内容只应产出一次")
+        self.assertLessEqual(calls["n"], 4, f"重取了 {calls['n']} 次，应 ≤4")
+
+    def test_keeps_going_while_new_items_appear(self):
+        clients = {}
+
+        def build():
+            from qqalbum.qzone import QzoneClient
+
+            client = object.__new__(QzoneClient)
+            client.log = lambda *_a, **_k: None
+            client.new_feeds_since_chunk = 0
+            client.last_feed_attach = ""
+            client.last_feed_attach_before = ""
+            step = {"n": 0}
+
+            def _feed_chunk(attach, feed_type, page_size, pages):
+                step["n"] += 1
+                off = 10 * step["n"]
+                if off > 30:
+                    return {"feeds": [], "attach": "offset=30&total=30&basetime=1"}
+                return {"feeds": [{"_batch_id": f"x{off}"}],
+                        "attach": f"offset={off}&total=30&basetime=1"}
+
+            client._feed_chunk = _feed_chunk  # type: ignore[assignment]
+            clients["step"] = step
+            return client
+
+        client = build()
+        items = list(client.iter_feeds(page_size=10, chunk_pages=1))
+        self.assertEqual(len(items), 3)
+        self.assertGreaterEqual(clients["step"]["n"], 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

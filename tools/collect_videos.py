@@ -9,16 +9,15 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, r"C:\path\to\qq-group-album-backup")
 
 from qqalbum.crawler import SyncState, BackupManager  # noqa: E402
-from qqalbum.store import Store  # noqa: E402
+from qqalbum.store import DEFAULT_DB, Store, default_root  # noqa: E402
 
-import os as _os
-GROUP = _os.environ.get("QQALBUM_GROUP", "<群号>")
-DB = r"<备份目录>\qqalbum.sqlite3"
+GROUP = "123456789"
+DB = DEFAULT_DB
 
 store = Store(DB)
 print("入库前视频数:", store.video_count(GROUP))
 
-manager = BackupManager(GROUP, store, root_dir=r"<备份目录>",
+manager = BackupManager(GROUP, store, root_dir=default_root(),
                         client_factory=lambda: None)
 state = manager.state
 

@@ -552,8 +552,12 @@ class Api:
         return {"connected": True, "session": client.session_info}
 
     def connect(self) -> Dict[str, Any]:
-        client = self.manager.client
-        return {"session": client.session_info}
+        # 真正去连接：ensure_connected 会启动浏览器、打开登录页并把窗口置顶。
+        # 原来这里只返回缓存的 session_info，浏览器没起来时接口看着"成功"，
+        # 用户却看不到任何窗口，也没法扫码。
+        client = self.manager.ensure_connected()
+        return {"session": client.session_info,
+                "browser_up": client.browser.is_up() if hasattr(client, "browser") else None}
 
     # ---------------------------------------------------------------- export
     def export_rows(self) -> List[Dict[str, Any]]:
@@ -1485,6 +1489,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(api.cancel())
         if path == "/api/connect":
             return self._json(api.connect())
+        if path == "/api/focus-login":
+            # 把扫码登录窗口叫到最前面。浏览器是后台进程拉起来的，
+            # 窗口可能开在别的窗口后面（用户会以为"Edge 没打开"）。
+            try:
+                from .window import focus_cdp_window
+                ok, msg = focus_cdp_window(9222)
+            except Exception as exc:  # 非 Windows / 权限不足
+                ok, msg = False, f"{type(exc).__name__}: {exc}"
+            return self._json({"ok": ok, "message": msg}, 200 if ok else 409)
         if path == "/api/tags":
             name = (payload.get("name") or "").strip()
             if not name:

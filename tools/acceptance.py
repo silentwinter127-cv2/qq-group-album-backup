@@ -9,11 +9,10 @@ import urllib.request
 sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qqalbum.store import Store  # noqa: E402
+from qqalbum.store import DEFAULT_DB, Store, default_root  # noqa: E402
 
-import os as _os
-G = _os.environ.get("QQALBUM_GROUP", "<群号>")
-ROOT = r"<备份目录>"
+G = "123456789"
+ROOT = default_root()
 BASE = "http://127.0.0.1:8787"
 FAILS = []
 

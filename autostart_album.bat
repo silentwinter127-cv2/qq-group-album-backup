@@ -3,34 +3,23 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 rem ============================================================
-rem  Logon entry point: if the album service is not up on 8787, start it.
-rem
-rem  The group number is required. Either pass it as the first argument, or
-rem  put it in the file "group.txt" next to this script (one line, digits only),
-rem  which keeps the group out of the task definition.
+rem  Logon entry point: if the album service is not up on 8787,
+rem  start it (hidden) and retry a few times.
 rem
 rem  Notes (things that bit me):
-rem   - Batch files must use CRLF line endings; with LF, cmd.exe chops the
-rem     script into garbage ("'-' is not recognized").
+rem   - Batch files must use CRLF line endings; with LF, cmd.exe
+rem     chops the script into garbage ("'-' is not recognized").
 rem   - No ^ line continuation inside ( ) blocks.
-rem   - Use !VAR! inside blocks, not %VAR%.
+rem   - Use !PORT! inside blocks, not %PORT%.
 rem ============================================================
 
-set GROUP=%~1
-if "!GROUP!"=="" (
-  if exist "%~dp0group.txt" set /p GROUP=<"%~dp0group.txt"
-)
-if "!GROUP!"=="" (
-  echo [ERROR] no group number: pass it as an argument or create group.txt
-  exit /b 2
-)
-
+set GROUP=123456789
 set PORT=8787
 set URL=http://127.0.0.1:8787/api/health
 set LOG=%~dp0tools\autostart.log
 if not exist "%~dp0tools" mkdir "%~dp0tools"
 
-call :log "===== autostart check (group !GROUP!) ====="
+call :log "===== autostart check ====="
 
 call :probe
 if /i "!STATE!"=="UP" (
@@ -45,7 +34,7 @@ if /i "!STATE!"=="OTHER" (
 
 for /L %%A in (1,1,3) do (
   call :log "attempt %%A ..."
-  start "" /b cmd /c ""%~dp0start_album.bat" !GROUP!"
+  start "" /b wscript.exe "%~dp0start_album_hidden.vbs"
   for /L %%B in (1,1,20) do (
     powershell -NoProfile -Command "Start-Sleep -Seconds 3" >nul 2>nul
     call :probe

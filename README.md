@@ -45,7 +45,7 @@
 命中描述时直接显示那句话，两者按可配置权重（默认各 50%）混合排序。
 描述检索不依赖向量索引，即使还没建索引也能用。
 
-实测（群 <群号>）：按相册标题做标注集验证，同一批照片用 4 个查询排序，
+实测（群 123456789）：按相册标题做标注集验证，同一批照片用 4 个查询排序，
 每个查询都在自己的类别上取得最高分，**自身查询 top-1 命中率 75%**；
 以图搜图时同批次照片相似度 0.7~0.85，不同内容约 0.1，区分度良好。
 
@@ -55,7 +55,7 @@
 > 支持随时停止、之后再「继续」（已完成的不会重算）。
 
 
-### 实测结果（群 <群号>）
+### 实测结果（群 123456789）
 
 ```
 相册 78 · 照片 44,932 · 已下载原图/动图 43,304（8.3 GB）· 仅缩略图 1,628 · 失败 0
@@ -88,10 +88,10 @@ pip install pillow
 ## 3. 快速开始
 ```powershell
 cd C:\path\to\qq-group-album-backup
-python -m qqalbum <群号>
+python -m qqalbum 123456789
 ```
 
-或双击 / 运行 `run_backup.bat <群号>`（群号必须自己传，详见 §3.1）。
+或双击 `run_backup.bat`（默认群号 123456789，可传参：`run_backup.bat 123456`）。
 
 启动后：
 
@@ -134,7 +134,7 @@ Unregister-ScheduledTask -TaskName QQAlbumBackup-WebUI -Confirm:$false
 
 ```powershell
 curl http://127.0.0.1:8787/api/health
-# {"ok":true,"service":"qqalbum","group_id":"<群号>","version":"QQAlbumBackup/1.0"}
+# {"ok":true,"service":"qqalbum","group_id":"123456789","version":"QQAlbumBackup/1.0"}
 ```
 
 不碰数据库、不加载模型，可用它判断「服务起没起、是不是这个端口」。
@@ -149,7 +149,7 @@ curl http://127.0.0.1:8787/api/health
 ```
 POST http://127.0.0.1:3000/get_group_album_media_list
 Authorization: Bearer <令牌>
-{"group_id":<群号>,"album_id":"<albumId>"}
+{"group_id":123456789,"album_id":"<albumId>"}
 → mediaList 里视频项为 {"video":{"id":…,"url":"….mp4","cover":{…}}}
 ```
 
@@ -197,7 +197,7 @@ Authorization: Bearer <令牌>
 <备份目录>\
 ├── qqalbum.sqlite3          # 全部元数据（相册/照片/评论/点赞/成员/原始 JSON）
 ├── photos\
-│   ├── <群号>\
+│   ├── 123456789\
 │   │   ├── <相册ID>\<上传者QQ>\<照片ID>.jpg     # 原图
 │   │   └── _thumbs\                             # 缩略图缓存（自动生成）
 │   └── _covers\                                 # 相册封面缓存
@@ -267,16 +267,16 @@ python -m qqalbum <群号> [选项]
 
 ```powershell
 # 只抓元数据并直接退出（跑批）
-python -m qqalbum <群号> --no-web --sync
+python -m qqalbum 123456789 --no-web --sync
 
 # 无头下载原图
-python -m qqalbum <群号> --no-web --download --workers 8
+python -m qqalbum 123456789 --no-web --download --workers 8
 
 # 建立 AI 索引（一次性，约 1 小时；也可在 WebUI 里点按钮）
-python -m qqalbum <群号> --no-web --ai-index
+python -m qqalbum 123456789 --no-web --ai-index
 
 # 只先索引 2000 张试试
-python -m qqalbum <群号> --no-web --ai-index --ai-limit 2000
+python -m qqalbum 123456789 --no-web --ai-index --ai-limit 2000
 
 # 查看已备份的群
 python -m qqalbum --groups
@@ -638,9 +638,24 @@ python tools\report_commit.py
 在自动打开的 Edge 窗口里扫码登录一次即可；登录态保存在 `<备份目录>\edge-profile`，
 之后无需重复登录。若窗口已被关闭，重新运行程序会自动拉起。
 
+登录窗口出现后，程序会**等你最多 5 分钟**：扫完码自动继续，不需要再点一次「开始抓取」。
+（早期版本这里有个 bug：登录状态是连接那一刻的快照，浏览器一直活着就永远不会重新读取，
+所以用户扫了码仍然一直报「尚未登录」，怎么重试都没用。已修为每次抓取前都重新问一次浏览器。）
+
 **Q：抓取动态时报「非该群成员，无法查看照片和进行操作」？**
 这是服务端限流。已抓取的数据会保留，等几分钟后再次点击「开始抓取元数据」，
 程序会从上次游标继续。
+
+**Q：进度卡在某个数字（比如 37/5391）一动不动？**
+这是早期版本的 bug，已修。QZone 的 `getFeeds` 走到信息流末尾时，会把**同一页**反复
+返回而不推进游标；旧代码把「有返回」当成「有进展」，于是每秒重取同一页、永远不结束
+（看起来就是卡死，其实在空转）。现在连续 3 次没有新条目就停止拉取并写日志。
+
+顺带修掉的两个相关问题：
+- 单页超时之和（20 页 × 15 秒 = 300 秒）大于外层 CDP 超时（120 秒），页面内的保护
+  永远来不及触发 —— 现在单页预算由外层超时反推，保证之和一定小于它。
+- 重连之后旧 CDP 会话在新连接上永远拿不到回包 —— 现在给连接编号，会话作废时立刻
+  重新 attach，而不是拿着死 id 等满两个超时。
 
 **Q：缩略图、封面显示不出来？**
 先安装 Pillow（`pip install pillow`）。未安装时缩略图会回退到 QQ CDN 直链，

@@ -7,14 +7,26 @@ import time
 import urllib.parse
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from .cdp import (Browser, CDPError, DEFAULT_PROFILE_DIR, PageSession,
-                  is_timeout_error)
+from .cdp import Browser, CDPError, PageSession, is_timeout_error
 from .js_bridge import batch_id_of, flatten_feed, js_bridge, js_call, parse_attach_info
 
 H5_BASE = "https://h5.qzone.qq.com"
 INDEX_URL = H5_BASE + "/groupphoto/index?inqq=3&groupId={gid}"
 LOGIN_URL = "https://i.qq.com/"
-DEFAULT_PROFILE = DEFAULT_PROFILE_DIR
+from .store import default_root as _default_root
+
+DEFAULT_PROFILE = _default_root() + "/edge-profile"
+
+# 一次 _feed_chunk 的 CDP 层超时。JS 内的单页 Promise.race 预算由它反推，
+# 保证单页超时之和一定小于它，否则页面内的保护形同虚设。
+EVAL_TIMEOUT_S = 120.0
+
+
+def feed_page_timeout_ms(pages: int) -> int:
+    """单页 Promise.race 预算：`pages` 页之和必须小于 EVAL_TIMEOUT_S。"""
+    pages = max(1, int(pages))
+    budget_ms = int(EVAL_TIMEOUT_S * 1000 * 0.7) // pages
+    return max(2000, min(15000, budget_ms))
 
 
 class QzoneError(RuntimeError):
@@ -146,6 +158,9 @@ class QzoneClient:
     def connect(self) -> Dict[str, Any]:
         """Attach to (or start) the browser and open the group album page."""
         self.browser.launch(self.index_url)
+        # 把登录/相册窗口提到最前面。浏览器是后台进程拉起来的，窗口常常开在别的窗口后面，
+        # 用户看不到就会以为「Edge 根本没打开」（扫码登录必须能看见窗口）。
+        self._focus_window()
         page = self.browser.page(self.index_url)
         page.enable_domains()
         if "groupphoto" not in (page.url() or ""):
@@ -160,10 +175,69 @@ class QzoneClient:
             time.sleep(0.5)
         page.eval(js_bridge(), timeout=60)
         self.session_info = self._probe_session()
+        # 没登录时窗口必须可见，否则用户无从扫码 —— 再置顶一次并说明原因
+        if not self.session_info.get("logged_in"):
+            ok, msg = self._focus_window()
+            self.log(f"尚未登录，已尝试将登录窗口置顶：{msg}")
+            if not ok:
+                self.log("若你确实看不到窗口，请检查计划任务是否为 Interactive（S4U 会创建在 Session 0，窗口不可见）")
         if not self._page_responsive():
             self.log("页面无响应，正在重启浏览器以恢复…")
             self.hard_restart()
         return self.session_info
+
+    def refresh_session(self, wait_login: float = 0.0, poll: float = 2.0,
+                        should_cancel: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+        """Re-read the live login state from the page, optionally waiting for a scan.
+
+        Why this exists: `Manager.ensure_connected()` used to reuse the cached
+        client whenever the CDP port was still open, and `session_info` is a
+        snapshot taken at `connect()` time.  A user who scanned the QR code
+        *after* that snapshot kept getting 「尚未登录」 no matter how many times
+        they retried, because nothing ever asked the browser again.  This
+        method always asks.
+
+        `wait_login` > 0 polls until the login completes, the deadline passes or
+        `should_cancel()` turns true — so a scan during a running sync is picked
+        up without the user having to click anything else.
+        """
+        if self._page is None:
+            return self.connect()
+        deadline = time.time() + max(0.0, float(wait_login))
+        while True:
+            try:
+                current = self._page.url() or ""
+            except (CDPError, QzoneError):
+                # 页面/会话已失效（浏览器重启过）：整条重连
+                self._page = None
+                return self.connect()
+            if not current or current.startswith("about:"):
+                # 空白页才导航；登录页上正显示二维码，导航会毁掉用户正在扫的码
+                try:
+                    self._page.navigate(self.index_url, wait=3.0)
+                    self._page.wait_ready(30)
+                    self._page.eval(js_bridge(), timeout=60)
+                except (CDPError, QzoneError):
+                    pass
+            try:
+                self.session_info = self._probe_session()
+            except (CDPError, QzoneError) as exc:
+                self.log(f"读取登录状态失败，重建浏览器会话：{exc}")
+                self._page = None
+                return self.connect()
+            if self.session_info.get("logged_in"):
+                return self.session_info
+            if time.time() >= deadline or (should_cancel is not None and should_cancel()):
+                return self.session_info
+            time.sleep(poll)
+
+    def _focus_window(self) -> "tuple[bool, str]":
+        """Best-effort: raise the CDP browser window. Never raises."""
+        try:
+            from .window import focus_cdp_window
+            return focus_cdp_window(self.browser.port)
+        except Exception as exc:  # 非 Windows 或权限不足都不该让抓取失败
+            return False, f"{type(exc).__name__}: {exc}"
 
     def _page_responsive(self, timeout: float = 20.0) -> bool:
         try:
@@ -308,6 +382,7 @@ class QzoneClient:
         count = 0
         total = 0
         empty_rounds = 0
+        stale_rounds = 0
         self.last_feed_attach = attach
 
         while count < max_items:
@@ -342,26 +417,50 @@ class QzoneClient:
                 if count >= max_items:
                     return
             if not fresh:
-                # no new content in this chunk: the cursor itself moved forward
+                # 这一整块没有新内容：游标已经推不动了（服务器把同一页又发了一遍）。
+                # 注意 feeds 非空时 empty_rounds 不会自增，所以必须单独计数，
+                # 否则会在末尾无限重取同一页 —— 表现就是「卡在 37/5391 一动不动」。
                 self.last_feed_attach_before = attach
+                stale_rounds += 1
+                if stale_rounds >= 3:
+                    self.log(
+                        "getFeeds 游标不再前进（连续 %d 次没有新动态），停止拉取" % stale_rounds)
+                    break
+            else:
+                stale_rounds = 0
             if should_stop and should_stop():
                 return
             offset = int(info.get("offset") or 0)
             if offset <= 0 or (total and offset >= total):
                 break
-            if not attach:
+            if not attach or attach == attach_before and not fresh:
                 break
         return
 
     def _feed_chunk(self, attach: str, feed_type: int, page_size: int,
                     pages: int) -> Dict[str, Any]:
-        """Fetch up to `pages` feed pages inside one CDP round trip."""
+        """Fetch up to `pages` feed pages inside one CDP round trip.
+
+        每一页都套了 Promise.race 超时：整段 JS 是顺序 await 的，只要某一页的
+        getFeeds 挂住（QZone 偶发不返回），整个 chunk 就会一直等到 CDP 层的超时，
+        而 CDPError 还会被 call() 重连重试一次，表现为「抓取卡住十几分钟、日志一动不动」。
+        单页超时后返回已经拿到的部分，让上层继续推进。
+
+        关键：**单页超时之和必须小于外层 eval 超时**，否则 JS 里的保护永远来不及触发，
+        先被 CDP 层打断（20 页 × 15 秒 = 300 秒 > 120 秒，这就是之前卡死的算术）。
+        """
+        per_page_ms = feed_page_timeout_ms(pages)
         expr = (
             "(async()=>{try{"
             "const G=window.GroupZone.GPHOTO;"
-            "let at=%s,all=[],guard=0;"
+            "let at=%s,all=[],guard=0,stalled=0;"
+            "const race=(p,ms)=>Promise.race([p,new Promise((_,rej)=>"
+            "setTimeout(()=>rej(new Error('page-timeout')),ms))]);"
             "while(guard<%d){guard++;"
-            "const d=await G.logic.getFeeds({gid:G.groupId,type:%d,getcnt:%d,curreuestinfo:at});"
+            "let d=null;"
+            "try{d=await race(G.logic.getFeeds({gid:G.groupId,type:%d,getcnt:%d,"
+            "curreuestinfo:at}),%d);}"
+            "catch(e){stalled=1;break;}"
             "const f=(d&&d.feeds)||[];"
             "const next=String((d&&d.curreuestinfo)||'');"
             "for(const x of f) all.push(x);"
@@ -371,17 +470,21 @@ class QzoneClient:
             "const t=at.match(/total=(\\d+)/);"
             "if(m&&t&&parseInt(m[1])>=parseInt(t)) break;"
             "}"
-            "return JSON.stringify({feeds:all,attach:at});"
+            "return JSON.stringify({feeds:all,attach:at,stalled:!!stalled});"
             "}catch(e){return JSON.stringify({feeds:[],attach:'',err:String(e&&(e.message||e))});}})()"
-            % (json.dumps(attach), max(1, int(pages)), feed_type, max(10, int(page_size)))
+            % (json.dumps(attach), max(1, int(pages)), feed_type,
+               max(10, int(page_size)), per_page_ms)
         )
-        raw = self.page.eval(expr, timeout=300)
+        raw = self.page.eval(expr, timeout=EVAL_TIMEOUT_S)
         try:
             payload = json.loads(raw or "{}")
         except ValueError:
             raise QzoneError("getFeeds: 返回内容无法解析")
         if payload.get("err"):
             raise QzoneError(f"getFeeds: {payload['err']}")
+        if payload.get("stalled"):
+            # 有一页超时了：把已拿到的部分先返回，游标指向已到达的位置
+            self.log("getFeeds 单页超时，先提交已取到的部分并继续")
         payload["feeds"] = [normalize_adapter_feed(f) for f in (payload.get("feeds") or [])]
         return payload
 

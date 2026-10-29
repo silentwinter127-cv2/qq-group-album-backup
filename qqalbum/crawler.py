@@ -82,6 +82,45 @@ class BackupManager:
             self._client.connect()
         return self._client
 
+    def ensure_connected(self, wait_login: float = 0.0) -> QzoneClient:
+        """Return a client whose browser is alive *and* whose login state is current.
+
+        为什么要专门做这个：`client` 属性一旦创建就永久缓存。Edge 崩溃、被关掉、
+        或者 OOM 之后，缓存的 client 还拿着旧的 session_info，于是每次都报
+        「尚未登录」，**再也不会去重新拉起浏览器** —— 用户看到的就是
+        「抓取不打开 Edge」。这里先检查 CDP 端口，断了就重建客户端并重新连接
+        （connect() 会启动浏览器、打开登录页并把窗口置顶）。
+
+        浏览器还活着的情况也必须重新探测登录状态：`session_info` 是 connect()
+        那一刻的快照，用户在那之后扫码登录时快照仍是 logged_in=False，于是每次
+        重试都直接失败，怎么扫都没用。`refresh_session()` 每次都会重新问浏览器。
+        """
+        if self._client is None:
+            return self.client
+        browser = getattr(self._client, "browser", None)
+        if browser is None:
+            # 测试替身（FakeClient）没有真实浏览器，按原样复用
+            return self._client
+        if browser.is_up():
+            try:
+                self._client.refresh_session(wait_login=wait_login,
+                                             should_cancel=lambda: bool(self.state.cancel))
+                return self._client
+            except Exception as exc:  # noqa: BLE001 - 任何失败都退化成重连
+                self.state.add_log(f"刷新登录状态失败，正在重新启动浏览器：{type(exc).__name__}: {exc}")
+        else:
+            self.state.add_log("浏览器已断开（可能崩溃或被关闭），正在重新启动…")
+        try:
+            old = self._client
+            self._client = self.client_factory()
+            self._client.connect()
+            # 旧客户端持有的 page 已经没用了，别再引用
+            old.session_info = {}
+        except Exception as exc:  # 重连失败时把原因说清楚，而不是留一个半死的 client
+            self.state.add_log(f"重新连接浏览器失败：{type(exc).__name__}: {exc}")
+            raise
+        return self._client
+
     def is_running(self) -> bool:
         return bool(self.state.running)
 
@@ -272,6 +311,7 @@ class BackupManager:
                                          _parent_id=comment["id"], source="feed-detail-reply"))
                 self.store.upsert_comments(self.group_id, rows)
             ok += 1
+            state.current, state.total = index, len(todo)
             if index % 25 == 0:
                 state.add_log(f"已补充 {index}/{len(todo)} 条动态明细")
         state.add_log(f"本次补充完成 {ok} 条动态的评论/点赞明细")
@@ -314,10 +354,27 @@ class BackupManager:
                      do_members: bool, incremental: bool, do_videos: bool = False) -> None:
         state = self.state
         try:
-            client = self.client
+            # 用 ensure_connected 而不是 self.client：浏览器崩了要能自动重新拉起，
+            # 而且每次都要重新探测登录状态（缓存快照会让扫码后依然报「尚未登录」）
+            client = self.ensure_connected()
             session = client.session_info
             if not session.get("logged_in"):
-                raise NotLoggedIn("浏览器尚未登录 QQ 空间，请先在自动打开的 Edge 窗口中扫码登录")
+                # 登录窗口已经置顶在用户面前；这里等一会儿，让用户有机会扫码，
+                # 扫完自动继续，不必再点一次「开始抓取」。（以前是立刻报错退出）
+                state.add_log("尚未登录：登录窗口已置顶，请在 Edge 里用手机 QQ 扫码。"
+                              "扫码完成后会自动继续（最多等待 5 分钟）…")
+                ok, msg = client._focus_window()
+                if not ok:
+                    state.add_log(f"置顶窗口失败：{msg}")
+                session = client.refresh_session(wait_login=300,
+                                                 should_cancel=lambda: bool(state.cancel))
+                if state.cancel:
+                    raise KeyboardInterrupt
+                if not session.get("logged_in"):
+                    raise NotLoggedIn(
+                        "等了 5 分钟仍未登录 QQ 空间。登录窗口应已打开并置顶，请在其中扫码登录；"
+                        "如果确实看不到任何 Edge 窗口，说明服务运行在服务会话（Session 0）里 —— "
+                        "计划任务请用 Interactive 登录类型，S4U 创建的窗口不会显示在桌面上。")
             state.add_log(f"已连接浏览器会话，uin={session.get('uin')}")
 
             server_time = client.get_server_time()
@@ -502,7 +559,7 @@ class BackupManager:
                                 candidate = getattr(client, "last_feed_attach_before", "") or cursor
                                 if candidate:
                                     cursor = candidate
-                            if feeds_seen % 200 == 0:
+                            if feeds_seen % 50 == 0:
                                 if cursor:
                                     self.store.set_meta(f"feed_cursor:{self.group_id}", cursor)
                                 state.add_log(f"动态进度 {feeds_seen} 条（游标已保存）")
@@ -575,7 +632,8 @@ class BackupManager:
             state.add_log(f"完成：相册 {stats['albums']}，照片 {stats['photos']}，评论 {stats['comments']}，"
                           f"点赞 {stats['likes']}"
                           + (f"，视频 {vstats['total']}" if do_videos else ""))
-            state.update(running=False, stage="done", finished_at=time.time())
+            state.update(running=False, stage="done", finished_at=time.time(),
+                         current=state.total or state.current)
         except KeyboardInterrupt:
             self.state.update(running=False, stage="cancelled", finished_at=time.time())
             self.state.add_log("已取消")

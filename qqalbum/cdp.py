@@ -12,20 +12,15 @@ import os
 import socket
 import struct
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-def _default_root() -> str:
-    env = os.environ.get("QQALBUM_ROOT")
-    if env:
-        return os.path.abspath(env)
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(here, "backup")
+from .store import default_root as _default_root
 
-
-DEFAULT_PROFILE_DIR = os.path.join(_default_root(), "edge-profile")
+DEFAULT_PROFILE_DIR = _default_root() + "/edge-profile"
 
 _BROWSER_CANDIDATES = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -56,6 +51,10 @@ def is_timeout_error(exc: BaseException) -> bool:
 
 class CDPError(RuntimeError):
     pass
+
+
+class CDPSessionLost(CDPError):
+    """会话随它所在的那条 WebSocket 一起失效了：必须重新 attach。"""
 
 
 class _WS:
@@ -158,12 +157,38 @@ class Browser:
         self._browser_ws: Optional[_WS] = None
         self._events: List[Dict[str, Any]] = []
         self._handlers: Dict[str, Any] = {}
+        # ⚠️ 一条 WebSocket 上只能有一个请求在等响应。`_call_once` 读完消息后发现
+        #    id 不匹配只会 dispatch 掉（不会留给自己也不留给别人），所以两个线程
+        #    同时发请求时，先到的响应会被别的线程吞掉，原请求方一直等到超时 ——
+        #    表现就是「CPU 静止、日志一动不动、卡到天荒地老」。
+        #    服务里抓取线程 / HTTP 接口线程 / 视频线程都会碰同一个 Browser，
+        #    所以所有 CDP 往返必须串行（RLock：同一线程内允许重入）。
+        self._lock = threading.RLock()
+        # CDP 的 flattened session 是**绑定在创建它的那条 WebSocket 上**的。
+        # 一旦 socket 被重建（任何一次断线重连），旧 sessionId 在新连接上永远得不到
+        # 回包 —— 浏览器不会报错，就是不回。若还用旧 id 发请求，只能等满超时，
+        # 于是「卡在 37 条、日志一动不动」。这里用代数（generation）识别并立刻报错，
+        # 交给 PageSession 换一个新会话。
+        self._ws_generation = 0
+        self._session_gen: Dict[str, int] = {}
+
+    def reset_connection(self) -> None:
+        """Drop the cached socket so the next call reconnects (call under the lock)."""
+        self._browser_ws = None
 
     # -- HTTP endpoints --------------------------------------------------
     def _http(self, path: str, timeout: float = 5.0) -> Any:
         url = f"http://127.0.0.1:{self.port}{path}"
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        # ⚠️ 必须把连接失败转成 CDPError：浏览器崩溃/被关掉时这里会抛 URLError，
+        #    而抓取层的重试逻辑只捕获 CDPError（重启浏览器续传），
+        #    URLError 会直接穿透，把一次「可恢复的浏览器崩溃」变成整个任务失败。
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise CDPError(f"CDP 端口 {self.port} 无法连接（浏览器可能已退出）：{exc}") from None
+        except (OSError, ValueError) as exc:
+            raise CDPError(f"CDP 端口 {self.port} 通信失败：{exc}") from None
 
     def is_up(self) -> bool:
         try:
@@ -226,6 +251,8 @@ class Browser:
                       f"Where-Object {{ $_.CommandLine -like '*{marker}*' }} | "
                       "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
                 subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               # 隐藏子进程控制台：服务在交互会话里，否则会闪黑框
+                               creationflags=0x08000000 if os.name == "nt" else 0,
                                capture_output=True, timeout=60)
             except Exception:
                 pass
@@ -258,32 +285,41 @@ class Browser:
         if self._browser_ws is None:
             ws_url = self.version()["webSocketDebuggerUrl"]
             self._browser_ws = _WS(ws_url, timeout=60)
+            self._ws_generation += 1
+            self._session_gen.clear()   # 旧连接上的会话全部作废
         return self._browser_ws
 
     def call(self, method: str, params: Optional[Dict[str, Any]] = None,
              target_id: Optional[str] = None, timeout: float = 30.0,
              session_id: Optional[str] = None) -> Dict[str, Any]:
-        """Issue a CDP command, rebuilding the browser connection once if it dropped."""
+        """Issue a CDP command, rebuilding the browser connection once if it dropped.
+
+        整段持锁：CDP 的响应只按 id 匹配，同一条 socket 上并发发请求会互相吞掉响应。
+        """
         payload: Dict[str, Any] = {"method": method, "params": params or {}}
-        try:
-            return self._call_once(payload, session_id, timeout)
-        except OSError as exc:  # connection reset / broken pipe: reconnect and retry once
-            self._browser_ws = None
-            time.sleep(0.6)
+        with self._lock:
+            if session_id and self._session_gen.get(session_id) != self._ws_generation:
+                # 立刻失败，别拿一条已经作废的会话去等满超时。
+                raise CDPSessionLost(
+                    f"{method}: session {session_id} 属于已断开的连接，需要重新 attach")
             try:
                 return self._call_once(payload, session_id, timeout)
-            except OSError as retry_exc:
-                raise CDPError(f"{method}: browser connection lost ({retry_exc})") from None
-        except CDPError:
-            if session_id:
-                # the flattened session may have died with a browser restart
+            except OSError as exc:  # connection reset / broken pipe: reconnect and retry once
                 self._browser_ws = None
-                time.sleep(0.3)
+                time.sleep(0.6)
+                if session_id:
+                    raise CDPSessionLost(f"{method}: 连接断开（{exc}），会话已失效") from None
                 try:
                     return self._call_once(payload, session_id, timeout)
-                except CDPError:
-                    pass
-            raise
+                except OSError as retry_exc:
+                    raise CDPError(f"{method}: browser connection lost ({retry_exc})") from None
+            except CDPError:
+                if session_id:
+                    # 重连后旧会话一定不可用，直接让调用方重新 attach。
+                    self._browser_ws = None
+                    time.sleep(0.3)
+                    raise CDPSessionLost(f"{method}: 会话失效，需要重新 attach") from None
+                raise
 
     def _call_once(self, payload: Dict[str, Any], session_id: Optional[str],
                    timeout: float) -> Dict[str, Any]:
@@ -328,20 +364,25 @@ class Browser:
                 pass
 
     def pump(self, seconds: float) -> None:
-        """Read and dispatch events for `seconds` (keeps the ws buffer drained)."""
-        ws = self._connect_browser()
-        ws.sock.settimeout(0.5)
-        deadline = time.time() + seconds
-        try:
-            while time.time() < deadline:
-                try:
-                    self._dispatch(ws.recv())
-                except socket.timeout:
-                    continue
-                except CDPError:
-                    break
-        finally:
-            ws.sock.settimeout(60)
+        """Read and dispatch events for `seconds` (keeps the ws buffer drained).
+
+        同样要持锁：pump 会从 socket 上读消息，抢在等待响应的 call() 前面就会把
+        那个响应吞掉（pump 只 dispatch 事件，method 为空的响应直接丢弃）。
+        """
+        with self._lock:
+            ws = self._connect_browser()
+            ws.sock.settimeout(0.5)
+            deadline = time.time() + seconds
+            try:
+                while time.time() < deadline:
+                    try:
+                        self._dispatch(ws.recv())
+                    except socket.timeout:
+                        continue
+                    except CDPError:
+                        break
+            finally:
+                ws.sock.settimeout(60)
 
     def on(self, event: str, handler) -> None:
         self._handlers[event] = handler
@@ -354,7 +395,10 @@ class Browser:
     def attach(self, target_id: str) -> str:
         """Attach to a target and return its flattened session id."""
         res = self.call("Target.attachToTarget", {"targetId": target_id, "flatten": True})
-        return res["sessionId"]
+        session_id = res["sessionId"]
+        # 记下这条会话是在第几代连接上创建的：连接重建后它必然作废。
+        self._session_gen[session_id] = self._ws_generation
+        return session_id
 
     def page(self, url: str = "about:blank", reuse: bool = True) -> "PageSession":
         """Get a PageSession for `url`, reusing an existing tab of that site."""
@@ -402,6 +446,17 @@ class Browser:
             self._browser_ws = None
 
 
+def _looks_dead_session(exc: Exception) -> bool:
+    """Is this error the kind a fresh session id would fix?"""
+    if isinstance(exc, CDPSessionLost):
+        return True
+    text = str(exc).lower()
+    return any(tok in text for tok in (
+        "timeout", "not found", "session", "no target", "detached",
+        "websocket read failed", "connection lost", "会话",
+    ))
+
+
 def _same_site(a: str, b: str) -> bool:
     def host(u: str) -> str:
         u = u.split("://", 1)[-1]
@@ -419,7 +474,20 @@ class PageSession:
 
     def call(self, method: str, params: Optional[Dict[str, Any]] = None,
              timeout: float = 30.0) -> Dict[str, Any]:
-        return self.browser.call(method, params, session_id=self.session_id, timeout=timeout)
+        try:
+            return self.browser.call(method, params, session_id=self.session_id,
+                                     timeout=timeout)
+        except CDPError as exc:
+            if self.target_id is None or not _looks_dead_session(exc):
+                raise
+            # 会话被别的 CDP 客户端 detach、或随浏览器重启一起失效时，浏览器不再给这个
+            # sessionId 回包，用同一个 id 重试只会再等一整个超时。重新 attach 一次。
+            try:
+                self.session_id = self.browser.attach(self.target_id)
+            except CDPError:
+                raise exc from None
+            return self.browser.call(method, params, session_id=self.session_id,
+                                     timeout=timeout)
 
     def enable_domains(self) -> None:
         for domain in ("Page", "Runtime", "Network"):

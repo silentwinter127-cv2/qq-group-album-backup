@@ -20,7 +20,21 @@ import sys
 import time
 import urllib.request
 
-sys.stdout.reconfigure(encoding="utf-8")
+# pythonw.exe 下没有控制台：sys.stdout/sys.stderr 是 None。
+# 必须在任何 reconfigure/print 之前兜底，否则 None.reconfigure 直接 AttributeError。
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+# 让子进程不弹控制台窗口（见 tools/_win.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _win import popen_hidden, run_hidden  # noqa: E402
+
+if sys.stdout is not None:
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
 ROOT = r"C:\path\to\qq-group-album-backup"
 TOOLS = os.path.join(ROOT, "tools")
 GROUP = "123456789"
@@ -63,7 +77,7 @@ def read_password() -> str:
 
 
 def port_has_listener() -> bool:
-    out = subprocess.run(
+    out = run_hidden(
         ["powershell", "-NoProfile", "-Command",
          f"(Get-NetTCPConnection -LocalPort {PORT} -State Listen "
          f"-ErrorAction SilentlyContinue | Measure-Object).Count"],
@@ -76,7 +90,7 @@ def port_has_listener() -> bool:
 
 def kill_stale_service() -> None:
     """端口被别的（可能是无口令的旧实例）占着时，先清掉再起。"""
-    subprocess.run(
+    run_hidden(
         ["powershell", "-NoProfile", "-Command",
          f"Get-NetTCPConnection -LocalPort {PORT} -State Listen "
          f"-ErrorAction SilentlyContinue | ForEach-Object "
@@ -94,7 +108,7 @@ def start_service() -> bool:
             "--host", "127.0.0.1", "--port", str(PORT),
             "--no-open", "--password", pw]
     with open(os.path.join(TOOLS, "webui_watchdog.log"), "ab") as out:
-        subprocess.Popen(args, cwd=ROOT, stdout=out, stderr=out,
+        popen_hidden(args, cwd=ROOT, stdout=out, stderr=out,
                          creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
     for _ in range(45):
         time.sleep(2)
@@ -113,7 +127,7 @@ def tunnel_url() -> str:
 
 
 def ngrok_alive() -> bool:
-    out = subprocess.run(
+    out = run_hidden(
         ["powershell", "-NoProfile", "-Command",
          "(Get-Process ngrok -ErrorAction SilentlyContinue | Measure-Object).Count"],
         capture_output=True, text=True, timeout=60)
@@ -125,7 +139,7 @@ def ngrok_alive() -> bool:
 
 def start_tunnel() -> bool:
     if ngrok_alive():
-        subprocess.run(["powershell", "-NoProfile", "-Command",
+        run_hidden(["powershell", "-NoProfile", "-Command",
                         "Get-Process ngrok -ErrorAction SilentlyContinue | "
                         "Stop-Process -Force -ErrorAction SilentlyContinue"],
                        capture_output=True, timeout=60)
@@ -135,7 +149,7 @@ def start_tunnel() -> bool:
     except OSError:
         pass
     with open(NGROK_LOG, "wb") as out:
-        subprocess.Popen([NGROK, "http", str(PORT), "--config", NGROK_CFG,
+        popen_hidden([NGROK, "http", str(PORT), "--config", NGROK_CFG,
                           "--log", "stdout", "--log-format", "json"],
                          stdout=out, stderr=out,
                          creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
@@ -184,4 +198,19 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # pythonw.exe 下任何未捕获异常都是"静默失败"（用户只看到计划任务 Result=1），
+    # 所以把 traceback 写进文件，出问题能查。
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+        try:
+            with open(os.path.join(TOOLS, "watchdog_crash.log"), "a",
+                      encoding="utf-8") as fh:
+                fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+                fh.write(traceback.format_exc() + "\n")
+        except OSError:
+            pass
+        raise

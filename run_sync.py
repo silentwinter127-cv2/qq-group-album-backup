@@ -9,10 +9,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from qqalbum.crawler import BackupManager  # noqa: E402
 from qqalbum.qzone import QzoneClient  # noqa: E402
-from qqalbum.store import Store  # noqa: E402
+from qqalbum.store import DEFAULT_DB, Store, default_root  # noqa: E402
 
 GROUP = sys.argv[1] if len(sys.argv) > 1 else "123456789"
-ROOT = r"<备份目录>"
+ROOT = default_root()
 DB = os.path.join(ROOT, "qqalbum.sqlite3")
 MODE = sys.argv[2] if len(sys.argv) > 2 else "all"
 
