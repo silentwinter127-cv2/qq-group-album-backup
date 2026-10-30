@@ -31,6 +31,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -138,27 +139,41 @@ def _first_url(photo_urls: Iterable[Dict[str, Any]], prefer: Iterable[int] = ())
     return ""
 
 
+def normalize_pickey(key: str) -> str:
+    """把 pickey 的分隔符统一成 `*`、去掉尾部 `!`，让不同接口的写法能对上。
+
+    同一个 pickey 在不同接口里写法不一样：
+
+        photos.lloc   V5bCgAxMDU1Mjc4MjM1**KGaOhkpB0!
+        视频封面地址   .../V5bCgAxMDU1Mjc4MjM1.*VTadAXjgg!/400
+
+    分隔符可能是 `*` 也可能是 `.`，结尾感叹号可能一个也可能两个（老群封面是
+    `...Cw!!`，新群是 `...jkAM!`）。按原文精确比较会一条都对不上 ——
+    这就是「163 个视频一个都没对上封面」的原因。
+    """
+    text = re.sub(r"[*.]+", "*", str(key or "").strip())
+    return text.rstrip("!")
+
+
 def pickey_from_cover(cover_url: str) -> str:
-    """从封面地址里抠出照片的 pickey。
+    """从封面地址里抠出照片的 pickey（已归一化，可直接与 photos.lloc 比）。
 
     ⚠️ 别用 video.cover.lloc：那是**另一种编码**（base64 变体），和 photos.lloc 对不上
     （实测 376 条一条都匹配不上）。而封面地址的路径里带的就是照片 pickey：
 
         https://qungz.photo.store.qq.com/qun-qungz/<album>/<PICKEY>!!/400?...
-                                                     ^^^^^^^ 这个和 photos.lloc 完全一致
+                                                     ^^^^^^^ 这个和 photos.lloc 同源
     """
     text = str(cover_url or "")
     if "/" not in text:
         return ""
-    # 去掉 query，取倒数第二段（最后一段是尺寸 400/800）
-    path = text.split("?")[0].rstrip("/")
+    # 去掉 query 与 #hash，取倒数第二段（最后一段是尺寸 400/800）
+    path = text.split("?")[0].split("#")[0].rstrip("/")
     parts = [p for p in path.split("/") if p]
     if len(parts) < 2:
         return ""
     segment = parts[-2] if parts[-1].isdigit() else parts[-1]
-    if segment.endswith("!!"):
-        return segment
-    return ""
+    return normalize_pickey(segment)
 
 
 def parse_media_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:

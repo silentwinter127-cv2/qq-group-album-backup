@@ -565,6 +565,11 @@ class Api:
         return {"started": ok, "reason": "" if ok else "已有任务在运行"}
 
     # --------------------------------------------------------------- videos
+    def start_video_sync(self) -> Dict[str, Any]:
+        """只重抓视频清单（不需要扫码登录，走机器人引擎）。"""
+        ok = self.manager.start_video_sync()
+        return {"started": ok, "reason": "" if ok else "已有任务在运行"}
+
     def videos(self, params: Dict[str, List[str]]) -> Dict[str, Any]:
         def one(key: str, default: str = "") -> str:
             values = params.get(key) or []
@@ -1565,6 +1570,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(api.start_download(payload))
         if path == "/api/download-videos":
             return self._json(api.start_video_download(payload))
+        if path == "/api/sync-videos":
+            return self._json(api.start_video_sync())
         if path == "/api/cancel":
             return self._json(api.cancel())
         if path == "/api/connect":

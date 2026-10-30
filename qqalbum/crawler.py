@@ -155,6 +155,21 @@ class BackupManager:
         self._download_thread.start()
         return True
 
+    def start_video_sync(self) -> bool:
+        """只抓视频清单，不需要浏览器登录。
+
+        视频地址来自机器人引擎 SnowLuma（带 Bearer token 的本地 HTTP 接口），
+        跟 QZone 的 p_skey 会话完全无关。所以「扫码过期了但还想补视频清单」
+        这件事可以单独做，不必让用户重新扫码。
+        """
+        if self.state.running:
+            return False
+        self._reset_state("videos")
+        self._video_sync_thread = threading.Thread(target=self._video_sync_worker,
+                                                   name="qqalbum-video-sync", daemon=True)
+        self._video_sync_thread.start()
+        return True
+
     def start_video_download(self, album_id: Optional[str] = None, limit: int = 0) -> bool:
         """下载视频。
 
@@ -701,6 +716,21 @@ class BackupManager:
         else:
             state.add_log("没有发现视频（也可能引擎里没有该群的视频信息）")
         state.counters["videos"] = len(seen)
+
+    def _video_sync_worker(self) -> None:
+        """只跑视频清单收集（不碰浏览器）。"""
+        state = self.state
+        try:
+            # 传空列表：_sync_videos 里 `albums = album_list or client.albums()`
+            # 会退回用引擎自己列出的相册，不需要浏览器里的相册接口
+            self._sync_videos(state, [])
+            state.update(running=False, stage="done", finished_at=time.time())
+        except Exception as exc:  # noqa: BLE001 —— 后台线程不能把异常丢掉
+            state.update(running=False, stage="error", error=f"{type(exc).__name__}: {exc}",
+                         finished_at=time.time())
+            state.add_log(f"错误：{type(exc).__name__}: {exc}")
+        finally:
+            self.state.update(running=False)
 
     def _video_download_worker(self, album_id: Optional[str], limit: int) -> None:
         state = self.state

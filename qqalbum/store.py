@@ -813,16 +813,35 @@ class Store:
         return {"total": total, "page": page, "per_page": per_page, "items": items}
 
     def link_videos_to_photos(self, group_id: str) -> int:
-        """按 lloc 把视频和它自己的封面照片对上（photos.lloc 与 video 的 cover.lloc 同源）。"""
-        cur = self.execute(
-            "UPDATE videos SET photo_id = ("
-            "  SELECT p.photo_id FROM photos p "
-            "  WHERE p.group_id=videos.group_id AND p.lloc=videos.lloc LIMIT 1"
-            ") WHERE group_id=? AND photo_id IS NULL AND lloc<>'' "
-            "AND EXISTS (SELECT 1 FROM photos p WHERE p.group_id=videos.group_id AND p.lloc=videos.lloc)",
+        """按 pickey 把视频和它自己的封面照片对上。
+
+        两个来源的写法不一样（分隔符 `*` vs `.`、结尾 `!` vs `!!`），所以两边都要先
+        归一化再比 —— 直接写 `p.lloc=videos.lloc` 会在某些群上一条都匹配不到。
+        照片几万条，在 Python 里建一次映射比写 SQL 正则简单也可控。
+        """
+        from .video import normalize_pickey  # 局部导入：store 被 video 依赖，避免循环
+
+        lookup: Dict[str, str] = {}
+        rows = self.query(
+            "SELECT photo_id, lloc FROM photos WHERE group_id=? AND lloc IS NOT NULL AND lloc<>''",
             (str(group_id),))
-        self.commit()
-        return cur.rowcount or 0
+        for row in rows:
+            lookup.setdefault(normalize_pickey(row["lloc"]), str(row["photo_id"]))
+
+        linked = 0
+        pending = self.query(
+            "SELECT video_id, lloc FROM videos WHERE group_id=? AND photo_id IS NULL AND lloc<>''",
+            (str(group_id),))
+        for row in pending:
+            photo_id = lookup.get(normalize_pickey(row["lloc"]))
+            if not photo_id:
+                continue
+            self.execute("UPDATE videos SET photo_id=? WHERE group_id=? AND video_id=?",
+                         (photo_id, str(group_id), row["video_id"]))
+            linked += 1
+        if linked:
+            self.commit()
+        return linked
 
     def video_ids_for_photos(self, group_id: str, photo_ids: Sequence[str]) -> Dict[str, str]:
         """photo_id → video_id（只对"这张照片是某个视频的封面"的那些）。

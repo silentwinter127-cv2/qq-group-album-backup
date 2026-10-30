@@ -12,6 +12,7 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock as mock
 from urllib import request as urlrequest
 
 def _find_project_root() -> str:
@@ -35,7 +36,7 @@ from qqalbum.js_bridge import (batch_id_of, build_attach_info, flatten_feed,  # 
                                js_bridge, js_call, parse_attach_info)
 from qqalbum.qzone import normalize_adapter_feed  # noqa: E402
 from qqalbum.store import Store, epoch_to_text  # noqa: E402
-from qqalbum.video import parse_media_item, pickey_from_cover  # noqa: E402
+from qqalbum.video import normalize_pickey, parse_media_item, pickey_from_cover  # noqa: E402
 from qqalbum.web import (Api, Auth, _csv_cell,  # noqa: E402
                          annotate_video_covers, filter_by_media)  # noqa: E402
 
@@ -1025,13 +1026,23 @@ class VideoParseTests(unittest.TestCase):
     def test_pickey_from_cover(self):
         url = ("https://qungz.photo.store.qq.com/qun-qungz/V63ehHrD4K/V5bCQA2ODQ2OTAyNTQH4RVquOH5Kw!!"
                "/400?w5=1564&h5=1080&t=1&rf=groupPhoto")
-        self.assertEqual(pickey_from_cover(url), "V5bCQA2ODQ2OTAyNTQH4RVquOH5Kw!!")
+        self.assertEqual(pickey_from_cover(url), "V5bCQA2ODQ2OTAyNTQH4RVquOH5Kw")
 
     def test_pickey_from_cover_variants(self):
-        self.assertEqual(pickey_from_cover("http://h/a/ABC!!/800"), "ABC!!")
-        self.assertEqual(pickey_from_cover("http://h/a/ABC!!"), "ABC!!")
+        self.assertEqual(pickey_from_cover("http://h/a/ABC!!/800"), "ABC")
+        self.assertEqual(pickey_from_cover("http://h/a/ABC!!"), "ABC")
         self.assertEqual(pickey_from_cover(""), "")
         self.assertEqual(pickey_from_cover("not a url"), "")
+
+    def test_pickey_from_cover_handles_single_bang_and_dot(self):
+        # 新群的封面是单感叹号 + `.` 分隔符，老群是 `!!` + `*`
+        url = ("https://qungz.photo.store.qq.com/qun-qungz/V60goSLS3jwjv54Z3tH81aOSGF1EnRD7/"
+               "V5bCgAxMDU1Mjc4MjM1.*VTadAXjgg!/400?ek=1&kp=1&w5=1920&h5=1080")
+        self.assertEqual(pickey_from_cover(url), "V5bCgAxMDU1Mjc4MjM1*VTadAXjgg")
+        # 归一化之后，`**` / `.*` / 尾部一个或两个 `!` 都应该等价
+        self.assertEqual(normalize_pickey("V5bCgAxMDU1Mjc4MjM1**KGaOhkpB0!"),
+                         normalize_pickey("V5bCgAxMDU1Mjc4MjM1.*KGaOhkpB0!"))
+        self.assertEqual(normalize_pickey("ABC!!"), normalize_pickey("ABC!"))
 
     def test_parse_media_item_video_only(self):
         self.assertIsNone(parse_media_item({"type": 1, "image": {"lloc": "X"}}))
@@ -1053,7 +1064,7 @@ class VideoParseTests(unittest.TestCase):
         })
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["video_id"], "1071_abc")
-        self.assertEqual(parsed["lloc"], "COVERPIC!!")
+        self.assertEqual(parsed["lloc"], "COVERPIC")
         self.assertEqual(parsed["width"], 1920)
         self.assertEqual(parsed["duration_ms"], 12000)
         self.assertIn("/800", parsed["cover_url"])
@@ -1854,6 +1865,63 @@ class FeedCursorTests(unittest.TestCase):
         items = list(client.iter_feeds(page_size=10, chunk_pages=1))
         self.assertEqual(len(items), 3)
         self.assertGreaterEqual(clients["step"]["n"], 3)
+
+
+class VideoOnlySyncTests(unittest.TestCase):
+    """视频清单来自机器人引擎，不该被「扫码过期」卡住。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(os.path.join(self.tmp.name, "t.sqlite3"))
+        self.used = []
+
+        def factory():
+            # 一旦去连浏览器就说明又走了需要登录的路径
+            self.used.append(1)
+            raise AssertionError("视频清单不该连浏览器")
+
+        self.manager = BackupManager(G, self.store, factory, root_dir=self.tmp.name)
+        self.api = Api(self.store, self.manager, G, self.tmp.name)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_starts_without_touching_the_browser(self):
+        syncs = []
+
+        def fake_sync_videos(state, album_list):
+            syncs.append(album_list)
+            state.counters["videos"] = 3
+
+        self.manager._sync_videos = fake_sync_videos  # type: ignore[assignment]
+
+        self.assertTrue(self.api.start_video_sync()["started"])
+        for _ in range(300):
+            if not self.manager.state.running:
+                break
+            time.sleep(0.02)
+        self.assertFalse(self.manager.state.running, "视频清单任务应当很快结束")
+        self.assertEqual(self.manager.state.stage, "done")
+        self.assertEqual(self.manager.state.counters.get("videos"), 3)
+        self.assertEqual(syncs, [[]], "应传空列表，让 _sync_videos 退回用引擎的相册列表")
+        self.assertEqual(self.used, [], "start_video_sync 不应去连浏览器")
+
+    def test_engine_down_only_logs(self):
+        # 引擎不可用时只记日志、状态正常结束，不能抛异常
+        from qqalbum.video import VideoUnavailable
+
+        def broken_connect(self):
+            raise VideoUnavailable("引擎没开")
+
+        with mock.patch("qqalbum.video.VideoClient.connect", broken_connect):
+            self.assertTrue(self.manager.start_video_sync())
+            for _ in range(300):
+                if not self.manager.state.running:
+                    break
+                time.sleep(0.02)
+        self.assertEqual(self.manager.state.stage, "done")
+        self.assertIsNone(self.manager.state.error)
 
 
 if __name__ == "__main__":
