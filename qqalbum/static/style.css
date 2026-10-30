@@ -362,7 +362,30 @@ table.data tr:hover td { background: var(--bg-card); }
 .table-wrap table.data { min-width: 520px; }
 
 @media (max-width: 900px) {
-  .axis-index { display: none; }
+  /* 时间轴：右侧年月索引不能直接隐藏 —— 那样手机上就没法跳到某个月了。
+     改成横向滚动的胶囊条，贴在内容上方。 */
+  .axis-layout { flex-direction: column; gap: 8px; align-items: stretch; }
+  .axis-stream { width: 100%; }
+  .axis-index {
+    display: flex; flex-direction: row; align-items: center; gap: 6px;
+    flex-wrap: nowrap;
+    flex: none; width: 100%; max-height: none; overflow-x: auto; overflow-y: hidden;
+    position: sticky; top: 0; z-index: 6; order: -1;
+    background: var(--bg); border-left: 0; border-bottom: 1px solid var(--line);
+    padding: 6px 2px 8px; scrollbar-width: none;
+  }
+  .axis-index::-webkit-scrollbar { display: none; }
+  .axis-index-title { display: none; }
+  .axis-year { display: flex; align-items: center; gap: 6px; margin-bottom: 0; flex: none; }
+  .axis-months { display: flex; flex-direction: row; gap: 6px; flex-wrap: nowrap; flex: none; }
+  .axis-year-head, .axis-month {
+    white-space: nowrap; padding: 4px 10px; border-radius: 14px;
+    border: 1px solid var(--line); font-size: 12.5px;
+  }
+  .axis-year-head .axis-dot { width: 7px; height: 7px; border-width: 1.5px; }
+  .axis-month { padding: 4px 9px; }
+  .axis-grid { grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 5px; }
+  .axis-day { margin-bottom: 12px; }
 
   /* 侧栏：固定定位的抽屉，默认整块推出屏幕外 */
   #app { display: block; height: 100vh; }
