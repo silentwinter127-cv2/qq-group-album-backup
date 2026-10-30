@@ -1192,7 +1192,10 @@ function renderUploaders(container) {
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
-  container.appendChild(table);
+  // 窄屏放不下 6 列，套一层横向滚动容器（否则右边整列被切掉）
+  const wrap = el('div', 'table-wrap');
+  wrap.appendChild(table);
+  container.appendChild(wrap);
 }
 
 function renderCommentRow(comment) {
@@ -1426,6 +1429,30 @@ async function boot() {
 
   document.querySelectorAll('.nav-item').forEach((btn) => {
     btn.onclick = () => { state.view = btn.dataset.view; render(); };
+  });
+
+  // 窄屏侧栏是抽屉：点 ☰ 打开，点遮罩/选完一项/按 Esc 关闭。
+  // 桌面上 .sidebar 是常驻的，这些类名不会产生视觉变化。
+  const sidebar = document.querySelector('.sidebar');
+  const scrim = $('#scrim');
+  const closeDrawer = () => {
+    if (!sidebar) return;
+    sidebar.classList.remove('open');
+    if (scrim) scrim.classList.add('hidden');
+  };
+  const openDrawer = () => {
+    if (!sidebar) return;
+    sidebar.classList.add('open');
+    if (scrim) scrim.classList.remove('hidden');
+  };
+  if ($('#btnMenu')) $('#btnMenu').onclick = openDrawer;
+  if (scrim) scrim.onclick = closeDrawer;
+  document.querySelectorAll('.nav-item').forEach((btn) => {
+    const prev = btn.onclick;
+    btn.onclick = (event) => { closeDrawer(); return prev ? prev(event) : undefined; };
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeDrawer();
   });
 
   let searchTimer = null;
