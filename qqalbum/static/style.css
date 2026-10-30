@@ -50,6 +50,10 @@ a { color: var(--accent); text-decoration: none; }
 .brand-title { font-weight: 600; }
 .brand-sub { color: var(--text-dim); font-size: 12px; }
 
+/* 多群切换：放在品牌下面，常驻可见（手机上在抽屉里） */
+.group-switch { margin: 10px 0 2px; }
+.group-switch .select { width: 100%; }
+
 .nav { display: flex; flex-direction: column; gap: 4px; }
 .nav-item {
   display: flex; align-items: center; gap: 9px;

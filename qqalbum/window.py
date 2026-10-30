@@ -33,17 +33,46 @@ def _user32():
 
 
 def cdp_pid(port: int = 9222) -> int:
-    """PID listening on the CDP port, or 0."""
+    """PID that owns the CDP port, or 0.
+
+    不能只看 `-State Listen`：实测有些 Edge 版本的调试端口在本机并不以 LISTENING
+    出现在 Get-NetTCPConnection 里（只有 ESTABLISHED），于是「端口明明能用、
+    函数却说没有浏览器」。这里把任何状态的连接都算进来，再挑出浏览器主进程。
+    """
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
-             f"-ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess"],
+             f"Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | "
+             f"Select-Object -ExpandProperty OwningProcess -Unique"],
             creationflags=_no_window(),
             capture_output=True, text=True, timeout=60)
-        return int((out.stdout or "0").strip() or 0)
+        candidates = [int(x) for x in (out.stdout or "").split() if x.strip().isdigit()]
     except Exception:
         return 0
+    if not candidates:
+        return 0
+    if len(candidates) == 1:
+        return candidates[0]
+    # 多个候选时，取「父进程不是浏览器」的那个 —— 那才是主进程，其余是渲染进程
+    try:
+        query = ";".join(f"(Get-CimInstance Win32_Process -Filter \"ProcessId={p}\")"
+                         f" | Select-Object ProcessId,Name,ParentProcessId" for p in candidates)
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"@({query}) | ForEach-Object {{ \"$($_.ProcessId) $($_.Name) $($_.ParentProcessId)\" }}"],
+            creationflags=_no_window(), capture_output=True, text=True, timeout=60)
+        rows = []
+        for line in (out.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0].isdigit():
+                rows.append((int(parts[0]), parts[1].lower(), int(parts[2])))
+        pid_set = {r[0] for r in rows}
+        roots = [r[0] for r in rows if r[2] not in pid_set]
+        if roots:
+            return min(roots)
+    except Exception:
+        pass
+    return min(candidates)
 
 
 def _session_of(pid: int) -> int:

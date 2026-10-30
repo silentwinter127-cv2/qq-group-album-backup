@@ -51,7 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="qqalbum",
         description="把 QQ 群相册的元数据（上传者/上传时间/评论/点赞）备份到本地 SQLite，"
                     "并下载原图，附带本地 WebUI 浏览与分类。")
-    parser.add_argument("group", nargs="?", default=None, help="QQ 群号，例如 123456789")
+    parser.add_argument("group", nargs="*", default=[], metavar="GROUP",
+                        help="要备份的 QQ 群号，可以给多个，例如：123456789 1055278235")
+    parser.add_argument("--group", action="append", dest="extra_groups", default=[],
+                        metavar="GROUP", help="额外要备份的群号，可重复写")
     parser.add_argument("--db", default=DEFAULT_DB, help=f"SQLite 数据库路径（默认 {DEFAULT_DB}）")
     parser.add_argument("--root", default=None, help="图片与缓存根目录（默认与数据库同目录）")
     parser.add_argument("--profile", default=DEFAULT_PROFILE, help="浏览器用户数据目录（保存登录态）")
@@ -125,19 +128,34 @@ def main(argv: Optional[list] = None) -> int:
             print(f"  图片目录: {os.path.join(root_dir, 'photos', row['group_id'])}")
         return 0
 
-    if not args.group:
+    # 位置参数 + --group 都可以给群号，去重并保持顺序
+    group_ids: List[str] = []
+    for raw in list(args.group or []) + list(args.extra_groups or []):
+        gid = str(raw).strip()
+        if gid and gid not in group_ids:
+            group_ids.append(gid)
+
+    if not group_ids:
         print("请提供群号，例如： python -m qqalbum 123456789", file=sys.stderr)
+        print("多个群可以一起写： python -m qqalbum 123456789 1055278235", file=sys.stderr)
         print("也可以先运行 --groups 查看已有备份。", file=sys.stderr)
         return 2
 
-    group_id = str(args.group)
+    def make_client_factory(gid: str):
+        def client_factory() -> QzoneClient:
+            return QzoneClient(gid, profile_dir=args.profile, browser_path=args.browser,
+                               headless=args.headless,
+                               log=lambda msg: print("[browser]", msg, flush=True))
+        return client_factory
 
-    def client_factory() -> QzoneClient:
-        return QzoneClient(group_id, profile_dir=args.profile, browser_path=args.browser,
-                           headless=args.headless, log=lambda msg: print("[browser]", msg, flush=True))
-
-    manager = BackupManager(group_id, store, client_factory, root_dir=root_dir,
-                            page_size=args.page_size, download_workers=args.workers)
+    # 每个群一个 BackupManager（各自一份同步状态），共用同一个浏览器与数据库
+    managers = {
+        gid: BackupManager(gid, store, make_client_factory(gid), root_dir=root_dir,
+                           page_size=args.page_size, download_workers=args.workers)
+        for gid in group_ids
+    }
+    group_id = group_ids[0]
+    manager = managers[group_id]
     engine = None
     if args.siglip_dir or args.ai_index:
         try:
@@ -179,11 +197,12 @@ def main(argv: Optional[list] = None) -> int:
             auth = None
 
     api = Api(store, manager, group_id, root_dir, engine=engine, model_dir=args.siglip_dir,
-              caption_engine=caption_engine, caption_dir=args.caption_dir, auth=auth)
+              caption_engine=caption_engine, caption_dir=args.caption_dir, auth=auth,
+              managers=managers)
 
-    print(f"群号        : {group_id}")
+    print(f"群号        : {', '.join(group_ids)}（当前 {group_id}）")
     print(f"数据库      : {db_path}")
-    print(f"图片目录    : {os.path.join(root_dir, 'photos', group_id)}")
+    print(f"图片目录    : {os.path.join(root_dir, 'photos', '<群号>')}")
     print(f"浏览器配置  : {args.profile}")
 
     if args.sync or args.download:
@@ -193,10 +212,16 @@ def main(argv: Optional[list] = None) -> int:
             print(f"浏览器会话  : uin={session.get('uin')} logged_in={session.get('logged_in')}")
         except Exception as exc:
             print(f"[warn] 自动连接浏览器失败：{type(exc).__name__}: {exc}", file=sys.stderr)
-        if args.sync:
-            api.start_sync({"incremental": not args.full, "videos": bool(args.videos)})
-        if args.download:
-            api.start_download({})
+        # 一个群一个群地跑：两个群同时抓会抢同一个浏览器，日志也没法看
+        for gid in managers:
+            api.select_group(gid)
+            mgr = managers[gid]
+            if args.sync:
+                api.start_sync({"incremental": not args.full, "videos": bool(args.videos)})
+            if args.download:
+                api.start_download({})
+            while mgr.state.running:
+                time.sleep(0.5)
 
     if args.download_videos:
         # 视频走机器人引擎，不需要浏览器；单独提示一下引擎状态，免得"没反应"

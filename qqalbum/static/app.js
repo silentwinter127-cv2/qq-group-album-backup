@@ -3,6 +3,7 @@
 
 const state = {
   view: 'albums',
+  group: '',          // 当前群号，由 /api/groups 决定，所有请求都带上它
   overview: null,
   filters: { album_id: '', uploader: '', tag_id: '', q: '', page: 1, per_page: 60,
              order: 'upload_desc', has_comment: '', has_like: '', downloaded: '', thumb_only: '',
@@ -35,7 +36,22 @@ function toast(message) {
 }
 
 async function api(path, options) {
-  const res = await fetch(path, options);
+  const opts = Object.assign({}, options);
+  const gid = state.group;
+  // 多群：每个请求都带上当前群号，后端据此切换数据源（GET 走查询串，POST 塞进 JSON）
+  if (gid && path.indexOf('/api/') === 0) {
+    const method = (opts.method || 'GET').toUpperCase();
+    if (method === 'GET') {
+      path += (path.indexOf('?') >= 0 ? '&' : '?') + 'group=' + encodeURIComponent(gid);
+    } else if (typeof opts.body === 'string' && opts.body) {
+      try {
+        const data = JSON.parse(opts.body);
+        data.group = gid;
+        opts.body = JSON.stringify(data);
+      } catch (e) { /* 不是 JSON（图片上传）就原样发 */ }
+    }
+  }
+  const res = await fetch(path, opts);
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = { error: text.slice(0, 300) }; }
@@ -1419,7 +1435,48 @@ async function pollAi() {
   }
 }
 
+async function loadGroups() {
+  const data = await api('/api/groups');
+  state.group = data.current;
+  const sel = $('#groupSelect');
+  if (!sel) return;
+  sel.innerHTML = '';
+  (data.items || []).forEach((item) => {
+    const opt = document.createElement('option');
+    opt.value = item.group_id;
+    // 没加载的群只能看已有数据，抓不了新的 —— 明确标出来，免得点了没反应
+    opt.textContent = `${item.name || 'QQ 群'} ${item.group_id}` + (item.loaded ? '' : '（只读）');
+    opt.selected = item.group_id === data.current;
+    sel.appendChild(opt);
+  });
+  sel.onchange = async () => {
+    const target = sel.value;
+    sel.disabled = true;
+    try {
+      await api('/api/group', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group_id: target }),
+      });
+      state.group = target;
+      state.view = 'albums';
+      state.photoPage = 1;
+      await loadOverview();
+      await loadAux();
+      await loadAiStatus();
+      render();
+      toast(`已切到群 ${target}`);
+    } catch (err) {
+      toast('切换失败：' + err.message);
+      sel.value = state.group;
+    } finally {
+      sel.disabled = false;
+    }
+  };
+}
+
 async function boot() {
+  await loadGroups();
   await loadOverview();
   await loadAux();
   await loadAiStatus();

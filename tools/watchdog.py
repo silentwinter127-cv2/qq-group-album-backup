@@ -38,6 +38,8 @@ if sys.stdout is not None:
 ROOT = r"C:\path\to\qq-group-album-backup"
 TOOLS = os.path.join(ROOT, "tools")
 GROUP = "123456789"
+# 多群：服务可以一次加载多个群，界面上再切换（第一个是默认打开的群）
+GROUPS = ["123456789", "1055278235"]
 PORT = 8787
 PW_FILE = os.path.join(ROOT, "album_password.txt")
 NGROK = os.path.join(TOOLS, "bin", "ngrok.exe")
@@ -104,7 +106,7 @@ def start_service() -> bool:
     if not pw:
         log("[错误] 拿不到口令，拒绝启动（对外发布必须带口令）")
         return False
-    args = [sys.executable, "-u", "-m", "qqalbum", GROUP,
+    args = [sys.executable, "-u", "-m", "qqalbum", *GROUPS,
             "--host", "127.0.0.1", "--port", str(PORT),
             "--no-open", "--password", pw]
     with open(os.path.join(TOOLS, "webui_watchdog.log"), "ab") as out:

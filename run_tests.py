@@ -396,6 +396,83 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(_csv_cell(None), "")
 
 
+class MultiGroupTests(unittest.TestCase):
+    """一个服务同时加载多个群：切换后所有读接口只看当前群。"""
+
+    OTHER = "100000002"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(os.path.join(self.tmp.name, "t.sqlite3"))
+        for gid, pid in ((G, "P1"), (self.OTHER, "P2")):
+            self.store.upsert_album(gid, {"id": "A1", "title": f"相册{gid}", "desc": "",
+                                          "photocnt": 1, "coverurl": "http://c/x"})
+            self.store.upsert_photos(gid, [
+                {"id": pid, "_album_id": "A1", "owner": "1", "ownername": f"人{gid}",
+                 "desc": f"照片{gid}", "uploadtime": 100, "burl": "http://c/x"},
+            ])
+        self.managers = {
+            gid: BackupManager(gid, self.store, lambda: None, root_dir=self.tmp.name)
+            for gid in (G, self.OTHER)
+        }
+        self.api = Api(self.store, self.managers[G], G, self.tmp.name,
+                       managers=self.managers)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_groups_lists_every_group_and_puts_current_first(self):
+        data = self.api.groups()
+        ids = [item["group_id"] for item in data["items"]]
+        self.assertIn(G, ids)
+        self.assertIn(self.OTHER, ids)
+        self.assertEqual(data["current"], G)
+        self.assertEqual([i["group_id"] for i in data["items"] if i["current"]], [G])
+        self.assertEqual(data["items"][0]["group_id"], G)
+        self.assertEqual(sorted(data["loaded"]), sorted([G, self.OTHER]))
+
+    def test_switching_group_changes_what_the_read_apis_see(self):
+        self.assertEqual(self.api.overview()["group_id"], G)
+        self.api.select_group(self.OTHER)
+        self.assertEqual(self.api.group_id, self.OTHER)
+        # 抓取/下载走的是 manager，必须一起换，否则「切群后点抓取」抓的还是旧群
+        self.assertIs(self.api.manager, self.managers[self.OTHER])
+        self.assertEqual(self.api.overview()["group_id"], self.OTHER)
+        items = self.api.photos({})["items"]
+        self.assertEqual([p["photo_id"] for p in items], ["P2"])
+        self.api.select_group(G)
+        self.assertEqual([p["photo_id"] for p in self.api.photos({})["items"]], ["P1"])
+
+    def test_switching_drops_indexers_that_captured_the_old_group(self):
+        self.api.indexer = object()
+        self.api.captioner = object()
+        self.api._searcher = object()
+        self.api.select_group(self.OTHER)
+        # 这三个对象构造时把群号存进了自己身上，不重建就会继续查旧群
+        self.assertIsNone(self.api.indexer)
+        self.assertIsNone(self.api.captioner)
+        self.assertIsNone(self.api._searcher)
+
+    def test_unknown_group_is_rejected_and_does_not_change_state(self):
+        with self.assertRaises(ValueError):
+            self.api.select_group("999999999")
+        self.assertEqual(self.api.group_id, G)
+        self.assertIs(self.api.manager, self.managers[G])
+
+    def test_empty_group_is_a_noop(self):
+        self.assertEqual(self.api.select_group(""), G)
+        self.assertEqual(self.api.select_group("   "), G)
+
+    def test_group_without_manager_is_listed_but_marked_not_loaded(self):
+        self.store.upsert_group("100000003", name="旧群", album_count=0, photo_count=0)
+        data = self.api.groups()
+        row = [i for i in data["items"] if i["group_id"] == "100000003"][0]
+        self.assertFalse(row["loaded"])
+        with self.assertRaises(ValueError):
+            self.api.select_group("100000003")
+
+
 class DownloaderTests(unittest.TestCase):
     """Stub/partial handling without touching the network."""
 

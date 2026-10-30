@@ -40,10 +40,18 @@ class Api:
     def __init__(self, store: Store, manager: BackupManager, group_id: str, root_dir: str,
                  engine=None, model_dir: Optional[str] = None,
                  caption_engine=None, caption_dir: Optional[str] = None,
-                 auth: Optional["Auth"] = None):
+                 auth: Optional["Auth"] = None,
+                 managers: Optional[Dict[str, BackupManager]] = None):
         self.store = store
-        self.manager = manager
         self.group_id = str(group_id)
+        # 多群：服务可以同时加载多个群，切换时只改「当前群号」。
+        # 读接口全都用 self.group_id，抓取/下载用 self.manager，
+        # 所以切群只要同时改这两个就够，不用改任何处理器。
+        self._managers: Dict[str, BackupManager] = {
+            str(gid): mgr for gid, mgr in (managers or {}).items() if mgr is not None
+        }
+        self._managers[self.group_id] = manager
+        self.manager = self._managers[self.group_id]
         self.root_dir = root_dir
         self.model_dir = model_dir
         self._engine = engine
@@ -54,6 +62,55 @@ class Api:
         self.indexer: Optional[AiIndexer] = None
         self.captioner: Optional[CaptionIndexer] = None
         self._searcher: Optional[AiSearch] = None
+
+    # ------------------------------------------------------------ 多群切换
+    def group_ids(self) -> List[str]:
+        """本次启动真正加载了（能抓取）的群号。"""
+        return sorted(self._managers)
+
+    def select_group(self, group_id: str) -> str:
+        """切到另一个群；空值表示「不改」。返回切换后的当前群号。"""
+        gid = str(group_id or "").strip()
+        if not gid or gid == self.group_id:
+            return self.group_id
+        manager = self._managers.get(gid)
+        if manager is None:
+            loaded = "、".join(self.group_ids()) or "无"
+            raise ValueError(f"本次启动没有加载群 {gid}（已加载：{loaded}）")
+        self.group_id = gid
+        self.manager = manager
+        # 这三个对象在构造时把群号存进了自己身上，切群必须重建，
+        # 否则会继续拿旧群的 ID 去查向量库和标签。
+        self.indexer = None
+        self.captioner = None
+        self._searcher = None
+        return self.group_id
+
+    def groups(self) -> Dict[str, Any]:
+        """数据库里所有的群 + 本次是否已加载。"""
+        items: List[Dict[str, Any]] = []
+        seen = set()
+        for row in self.store.query("SELECT * FROM groups"):
+            gid = str(row["group_id"])
+            seen.add(gid)
+            items.append({
+                "group_id": gid,
+                "name": row["name"],
+                "album_count": row["album_count"] or 0,
+                "photo_count": row["photo_count"] or 0,
+                "member_count": row["member_count"] or 0,
+                "last_sync_at": row["last_sync_at"],
+                "loaded": gid in self._managers,
+                "current": gid == self.group_id,
+            })
+        for gid in self.group_ids():
+            if gid in seen:  # 加载了但还没抓过：也要能选，否则第一次备份无从下手
+                continue
+            items.append({"group_id": gid, "name": None, "album_count": 0,
+                          "photo_count": 0, "member_count": 0, "last_sync_at": None,
+                          "loaded": True, "current": gid == self.group_id})
+        items.sort(key=lambda item: (not item["current"], item["group_id"]))
+        return {"items": items, "current": self.group_id, "loaded": self.group_ids()}
 
     # ------------------------------------------------------------ AI plumbing
     def _engine_or_none(self):
@@ -1023,6 +1080,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "service": "qqalbum", "group_id": api.group_id,
                                "auth_required": api.auth is not None,
                                "version": Handler.server_version})
+        # 多群：前端每个请求都带 ?group=<群号>，这里统一切换，
+        # 后面的处理器一行都不用改。
+        gid = (params.get("group") or [""])[0].strip()
+        if gid:
+            try:
+                api.select_group(gid)
+            except ValueError as exc:
+                return self._error(str(exc), 400)
+        if path == "/api/groups":
+            return self._json(api.groups())
         if path == "/api/overview":
             return self._json(api.overview())
         if path == "/api/photos":
@@ -1479,6 +1546,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_post(self, path: str, payload: Dict[str, Any]) -> None:
         api = self.api
+        if path == "/api/group":
+            # 显式切群：返回切换后的群列表，前端据此刷新整个界面
+            try:
+                api.select_group(str(payload.get("group_id") or ""))
+            except ValueError as exc:
+                return self._error(str(exc), 400)
+            return self._json(api.groups())
+        gid = str(payload.get("group") or "").strip()
+        if gid:
+            try:
+                api.select_group(gid)
+            except ValueError as exc:
+                return self._error(str(exc), 400)
         if path == "/api/sync":
             return self._json(api.start_sync(payload))
         if path == "/api/download":
